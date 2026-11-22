@@ -1,26 +1,26 @@
-# ==UserScript==
-# @name         X/Twitter 视频下载按钮
-# @namespace    https://github.com/xifandev/Tampermonkey
-# @version      1.2.1
-# @description  在含视频的推文操作栏添加醒目的"下载"按钮，一键保存最高画质 MP4 到本地
-# @author       xifan
-# @license      MIT
-# @match        https://x.com/*
-# @match        https://twitter.com/*
-# @match        https://mobile.twitter.com/*
-# @run-at       document-start
-# @grant        GM_xmlhttpRequest
-# @grant        GM_download
-# @grant        unsafeWindow
-# @connect      video.twimg.com
-# @connect      twimg.com
-# @connect      cdn.syndication.twimg.com
-# @connect      api.fxtwitter.com
-# @updateURL    https://raw.githubusercontent.com/xifandev/Tampermonkey/main/scripts/twitter-video-dl.user.js
-# @downloadURL  https://raw.githubusercontent.com/xifandev/Tampermonkey/main/scripts/twitter-video-dl.user.js
-# @supportURL   https://github.com/xifandev/Tampermonkey/issues
-# @homepageURL  https://github.com/xifandev/Tampermonkey
-# ==/UserScript==
+// ==UserScript==
+// @name         X/Twitter 视频下载按钮
+// @namespace    https://github.com/xifandev/Tampermonkey
+// @version      1.2.2
+// @description  在含视频的推文操作栏添加醒目的"下载"按钮，一键保存最高画质 MP4 到本地
+// @author       xifan
+// @license      MIT
+// @match        https://x.com/*
+// @match        https://twitter.com/*
+// @match        https://mobile.twitter.com/*
+// @run-at       document-start
+// @grant        GM_xmlhttpRequest
+// @grant        GM_download
+// @grant        unsafeWindow
+// @connect      video.twimg.com
+// @connect      twimg.com
+// @connect      cdn.syndication.twimg.com
+// @connect      api.fxtwitter.com
+// @updateURL    https://raw.githubusercontent.com/xifandev/Tampermonkey/main/twitter-video-dl.user.js
+// @downloadURL  https://raw.githubusercontent.com/xifandev/Tampermonkey/main/twitter-video-dl.user.js
+// @supportURL   https://github.com/xifandev/Tampermonkey/issues
+// @homepageURL  https://github.com/xifandev/Tampermonkey
+// ==/UserScript==
 
 (function () {
   'use strict';
