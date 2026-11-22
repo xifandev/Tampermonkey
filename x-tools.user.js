@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         X/Twitter 视频下载按钮
+// @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.2.2
-// @description  在含视频的推文操作栏添加醒目的"下载"按钮，一键保存最高画质 MP4 到本地
+// @version      1.3.0
+// @description  推特小工具集：推文视频一键下载（最高画质 MP4）。浏览推特时的实用小功能都会加进这个脚本
 // @author       xifan
 // @license      MIT
 // @match        https://x.com/*
@@ -16,8 +16,8 @@
 // @connect      twimg.com
 // @connect      cdn.syndication.twimg.com
 // @connect      api.fxtwitter.com
-// @updateURL    https://raw.githubusercontent.com/xifandev/Tampermonkey/main/twitter-video-dl.user.js
-// @downloadURL  https://raw.githubusercontent.com/xifandev/Tampermonkey/main/twitter-video-dl.user.js
+// @updateURL    https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js
+// @downloadURL  https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js
 // @supportURL   https://github.com/xifandev/Tampermonkey/issues
 // @homepageURL  https://github.com/xifandev/Tampermonkey
 // ==/UserScript==
@@ -78,7 +78,7 @@
           const id = node.rest_id || node.legacy?.id_str;
           if (id && /^\d+$/.test(String(id))) {
             videoCache.set(String(id), mp4s);
-            console.debug('[TVD] 已捕获视频:', id, mp4s[0].url);
+            console.debug('[X-Tools] 已捕获视频:', id, mp4s[0].url);
           }
         }
       });
@@ -292,7 +292,7 @@
     for (const [name, fn] of channels) {
       try {
         await fn();
-        console.debug('[TVD] 下载成功，通道:', name);
+        console.debug('[X-Tools] 下载成功，通道:', name);
         return { ok: true };
       } catch (e) {
         errors.push(`${name}: ${e?.message || e}`);
