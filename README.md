@@ -4,18 +4,9 @@
 
 ## 脚本列表
 
-| 脚本 | 说明 | 适用站点 |
-|------|------|----------|
-| [x-tools](x-tools.user.js) | X Tools 推特小工具：推文视频一键下载（最高画质 MP4），功能持续增加 | x.com / twitter.com |
-
-## 安装
-
-1. 浏览器安装 [篡改猴](https://www.tampermonkey.net/) 扩展
-2. 打开脚本 raw 链接，篡改猴自动弹出安装确认：
-
-```
-https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js
-```
+| 脚本 | 说明 | 适用站点 | 安装 |
+|------|------|----------|------|
+| [x-tools](x-tools.user.js) | X Tools 推特小工具：推文视频一键下载（最高画质 MP4），功能持续增加 | x.com / twitter.com | [点击安装](https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js) |
 
 ## 更新
 
