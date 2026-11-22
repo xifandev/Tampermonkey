@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.4.0
+// @version      1.4.1
 // @description  推特小工具集：视频一键下载、广告屏蔽、悬浮控制面板，功能持续增加
 // @author       xifan
 // @license      MIT
@@ -76,7 +76,7 @@
         GM_registerMenuCommand('打开 X Tools 面板', () => this.toggle(true));
       }
       const mount = () => {
-        document.body.appendChild(this.button);
+        mountFab(this.button);
         document.body.appendChild(this.card);
         this.button.addEventListener('click', (e) => {
           e.preventDefault();
@@ -92,6 +92,10 @@
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape' && this.open) this.toggle(false);
         });
+        // 守卫：X 是 SPA，容器可能被重建导致按钮丢失，定时检查并重新挂载
+        setInterval(() => {
+          if (!document.body.contains(this.button)) mountFab(this.button);
+        }, 2000);
       };
       if (document.body) mount();
       else {
@@ -104,8 +108,16 @@
 
     toggle(force) {
       this.open = (force === undefined) ? !this.open : force;
+      if (this.open) this.positionCard();
       this.card.style.display = this.open ? 'flex' : 'none';
       this.button.classList.toggle('xt-btn-active', this.open);
+    },
+
+    // 面板贴在按钮左侧弹出，位置按按钮实时计算
+    positionCard() {
+      const r = this.button.getBoundingClientRect();
+      this.card.style.right = Math.max(12, window.innerWidth - r.left + 12) + 'px';
+      this.card.style.bottom = Math.max(12, window.innerHeight - r.bottom) + 'px';
     },
 
     // 重建开关列表（设置变化时调用）
@@ -153,24 +165,28 @@
     const style = document.createElement('style');
     style.id = 'xt-style';
     style.textContent = `
-      /* 悬浮按钮 */
+      /* 悬浮按钮：默认内联进 X 官方悬浮按钮容器，样式运行时复制官方按钮 */
       .xt-fab {
-        position: fixed; right: 16px; bottom: 96px; z-index: 2147483646;
-        width: 48px; height: 48px; border-radius: 50%;
-        background: rgba(29, 155, 240, 0.92);
-        border: 2px solid rgba(255,255,255,0.18);
-        color: #fff; cursor: pointer;
         display: flex; align-items: center; justify-content: center;
-        box-shadow: 0 4px 14px rgba(0,0,0,0.4);
-        transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
-        backdrop-filter: blur(6px);
+        box-sizing: border-box; flex-shrink: 0;
+        cursor: pointer; padding: 0; outline: none;
+        transition: transform 0.15s, filter 0.15s;
       }
-      .xt-fab:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(29,155,240,0.5); }
-      .xt-fab:active { transform: scale(0.96); }
-      .xt-fab.xt-btn-active { background: rgb(29, 155, 240); box-shadow: 0 6px 20px rgba(29,155,240,0.6); }
+      .xt-fab:hover { transform: scale(1.06); filter: brightness(1.3); }
+      .xt-fab:active { transform: scale(0.95); }
+      .xt-fab.xt-btn-active { filter: brightness(1.4); }
+      /* 兜底：找不到官方容器时才固定定位 */
+      .xt-fab.xt-fab-fallback {
+        position: fixed; right: 16px; bottom: 96px; z-index: 2147483646;
+        width: 50px; height: 50px; border-radius: 16px;
+        background: rgba(22, 24, 28, 0.96); color: #fff;
+        border: 1px solid rgba(255, 255, 255, 0.16);
+        box-shadow: 0 0 14px rgba(255, 255, 255, 0.10), 0 4px 14px rgba(0, 0, 0, 0.45);
+        backdrop-filter: blur(8px);
+      }
       /* 面板卡片 */
       .xt-card {
-        position: fixed; right: 16px; bottom: 152px; z-index: 2147483647;
+        position: fixed; z-index: 2147483647;
         width: 300px; display: none; flex-direction: column;
         background: rgba(21, 24, 28, 0.96);
         border: 1px solid rgba(255,255,255,0.1);
@@ -228,11 +244,7 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  // 悬浮按钮上的图标（滑块/工具感）
-  const FAB_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">'
-    + '<path d="M12 2l2.4 4.8 5.3.8-3.8 3.7.9 5.3L12 14.9 7.2 17.6l.9-5.3L4.3 8.6l5.3-.8L12 2z"/>'
-    + '</svg>';
-  // 简化：用一个齿轮+星 的混合，实际用滑块图标更贴"工具开关"
+  // 悬浮按钮图标：双滑块，贴"工具开关"语义
   const FAB_ICON_SLIDER = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">'
     + '<line x1="4" y1="8" x2="20" y2="8"/><circle cx="9" cy="8" r="2.2" fill="currentColor"/>'
     + '<line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="16" r="2.2" fill="currentColor"/>'
@@ -248,6 +260,52 @@
     return btn;
   }
 
+  // 把按钮挂进 X 官方悬浮按钮容器（Grok 上方），并复制官方按钮的视觉样式，
+  // 让 X 自己的布局系统管理位置与间距——不做任何硬编码定位。
+  function mountFab(btn) {
+    const grok = document.querySelector('button[aria-label="Grok"]');
+    const chat = document.querySelector('button[aria-label="聊天"]');
+    if (grok && grok.parentElement) {
+      // 复制官方按钮 computed style，保证尺寸/圆角/背景/发光完全一致
+      const cs = getComputedStyle(grok);
+      btn.style.width = cs.width;
+      btn.style.height = cs.height;
+      btn.style.borderRadius = cs.borderRadius;
+      btn.style.background = cs.backgroundColor;
+      btn.style.color = cs.color;
+      btn.style.boxShadow = cs.boxShadow;
+      btn.style.borderTop = cs.borderTop;
+      btn.style.borderRight = cs.borderRight;
+      btn.style.borderBottom = cs.borderBottom;
+      btn.style.borderLeft = cs.borderLeft;
+      btn.style.marginTop = cs.marginTop;
+      btn.style.marginBottom = cs.marginBottom;
+      btn.style.marginLeft = cs.marginLeft;
+      btn.style.marginRight = cs.marginRight;
+
+      const directParent = grok.parentElement;
+      if (!chat || directParent.contains(chat)) {
+        // 两个官方按钮共父级：直接插到 Grok 之前（更靠上），由容器 flex 排布
+        directParent.insertBefore(btn, grok);
+      } else {
+        // 各自包了一层：向上找共同容器，插到最前
+        let host = directParent;
+        while (host && host !== document.body && !host.contains(chat)) host = host.parentElement;
+        if (host && host !== document.body) host.insertBefore(btn, host.firstChild);
+        else directParent.insertBefore(btn, grok);
+      }
+      console.log(PREFIX, '悬浮按钮已注入官方容器');
+      return true;
+    }
+    // 兜底：找不到官方容器，用固定定位
+    if (!document.body.contains(btn)) {
+      btn.classList.add('xt-fab-fallback');
+      document.body.appendChild(btn);
+      console.log(PREFIX, '未找到官方容器，使用兜底定位');
+    }
+    return false;
+  }
+
   function createCard() {
     const card = document.createElement('div');
     card.className = 'xt-card';
@@ -258,7 +316,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.4.0</span>' +
+        '<span>v1.4.1</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -675,7 +733,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.4.0');
+    console.log(PREFIX, '已启动 v1.4.1');
   }
 
   // document-start 期 hook 网络要尽早，但 DOM 操作需等 body
