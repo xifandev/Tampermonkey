@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.3.0
-// @description  推特小工具集：推文视频一键下载（最高画质 MP4）。浏览推特时的实用小功能都会加进这个脚本
+// @version      1.4.0
+// @description  推特小工具集：视频一键下载、广告屏蔽、悬浮控制面板，功能持续增加
 // @author       xifan
 // @license      MIT
 // @match        https://x.com/*
@@ -11,6 +11,9 @@
 // @run-at       document-start
 // @grant        GM_xmlhttpRequest
 // @grant        GM_download
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // @connect      video.twimg.com
 // @connect      twimg.com
@@ -26,417 +29,662 @@
   'use strict';
 
   /* ============================================================
-   * 工作原理（与各类"粘贴链接下载"网站相同）：
-   * 1. 主路径：X 网页版加载推文时，内部 GraphQL 接口的响应里
-   *    就带着 video_info.variants（各码率 MP4 直链）。脚本在
-   *    document-start 阶段 hook 页面的 fetch / XHR 缓存下来。
-   * 2. 兜底 A：Twitter 官方嵌入推文接口（Syndication API），
-   *    无需登录，token 由推文 ID 算出。
-   * 3. 兜底 B：开源项目 FixTweet 的公共 API（api.fxtwitter.com）。
+   * X Tools 推特小工具
+   * 模块结构：
+   *   1. Settings  —— 开关持久化（GM 存储）
+   *   2. Panel     —— 悬浮按钮 + 浮窗控制面板
+   *   3. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，零网络拦截，防封号）
+   *   4. VideoDL   —— 推文视频下载（hook GraphQL + 多源兜底）
    * ============================================================ */
 
-  // tweetId -> [{url, bitrate}] 按码率从高到低排序
-  const videoCache = new Map();
-
   const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
+  const PREFIX = '[X-Tools]';
 
-  /* ---------- 0. 文件名：随机时间戳，不含任何推文信息 ---------- */
+  /* ============================================================
+   * 1. Settings —— 开关持久化
+   * ============================================================ */
 
-  function genFilename() {
-    const d = new Date();
-    const p = (n) => String(n).padStart(2, '0');
-    const stamp = `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_` +
-                  `${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
-    const rand = Math.random().toString(36).slice(2, 8);
-    return `${stamp}_${rand}.mp4`;
-  }
+  const Settings = {
+    defaults: {
+      hideAds: true,        // 广告屏蔽
+      videoDownload: true,  // 视频下载按钮
+    },
+    get(key) {
+      const v = GM_getValue('xt_' + key, undefined);
+      return v === undefined ? this.defaults[key] : v;
+    },
+    set(key, val) {
+      GM_setValue('xt_' + key, val);
+    },
+  };
 
-  /* ---------- 1. 从接口响应中提取视频地址 ---------- */
+  /* ============================================================
+   * 2. Panel —— 悬浮按钮 + 浮窗控制面板
+   * ============================================================ */
 
-  function walk(node, cb) {
-    if (!node || typeof node !== 'object') return;
-    cb(node);
-    for (const key of Object.keys(node)) {
-      const child = node[key];
-      if (child && typeof child === 'object') walk(child, cb);
-    }
-  }
+  const Panel = {
+    button: null,
+    card: null,
+    open: false,
 
-  function extractFromJson(json) {
-    try {
-      walk(json, (node) => {
-        const media = node.extended_entities?.media || node.entities?.media;
-        if (!Array.isArray(media)) return;
-        for (const m of media) {
-          const variants = m.video_info?.variants;
-          if (!Array.isArray(variants)) continue;
-          const mp4s = variants
-            .filter(v => v.content_type === 'video/mp4' && v.url)
-            .map(v => ({ url: v.url, bitrate: v.bitrate || 0 }))
-            .sort((a, b) => b.bitrate - a.bitrate);
-          if (!mp4s.length) continue;
-          const id = node.rest_id || node.legacy?.id_str;
-          if (id && /^\d+$/.test(String(id))) {
-            videoCache.set(String(id), mp4s);
-            console.debug('[X-Tools] 已捕获视频:', id, mp4s[0].url);
-          }
-        }
-      });
-    } catch (e) { /* 忽略解析失败 */ }
-  }
-
-  // 覆盖 X 网页版的全部内部 GraphQL 请求，不再只匹配固定接口名
-  const API_PATTERN = /\/i\/api\/graphql\//;
-
-  /* hook fetch */
-  const origFetch = w.fetch;
-  w.fetch = function (...args) {
-    const promise = origFetch.apply(this, args);
-    try {
-      const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-      if (API_PATTERN.test(url)) {
-        promise.then(res => {
-          res.clone().text().then(t => {
-            try { extractFromJson(JSON.parse(t)); } catch (e) {}
-          }).catch(() => {});
-        }).catch(() => {});
+    init() {
+      injectPanelStyle();
+      this.button = createButton();
+      this.card = createCard();
+      // 篡改猴菜单也加入口
+      if (typeof GM_registerMenuCommand === 'function') {
+        GM_registerMenuCommand('打开 X Tools 面板', () => this.toggle(true));
       }
-    } catch (e) {}
-    return promise;
-  };
-
-  /* hook XMLHttpRequest */
-  const origOpen = w.XMLHttpRequest.prototype.open;
-  const origSend = w.XMLHttpRequest.prototype.send;
-  w.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-    this.__tvdUrl = url;
-    return origOpen.call(this, method, url, ...rest);
-  };
-  w.XMLHttpRequest.prototype.send = function (...args) {
-    try {
-      if (API_PATTERN.test(this.__tvdUrl || '')) {
-        this.addEventListener('load', function () {
-          try { extractFromJson(JSON.parse(this.responseText)); } catch (e) {}
+      const mount = () => {
+        document.body.appendChild(this.button);
+        document.body.appendChild(this.card);
+        this.button.addEventListener('click', (e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          this.toggle();
         });
+        // 点面板外关闭
+        document.addEventListener('click', (e) => {
+          if (this.open && !this.card.contains(e.target) && !this.button.contains(e.target)) {
+            this.toggle(false);
+          }
+        });
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape' && this.open) this.toggle(false);
+        });
+      };
+      if (document.body) mount();
+      else {
+        const obs = new MutationObserver(() => {
+          if (document.body) { obs.disconnect(); mount(); }
+        });
+        obs.observe(document.documentElement, { childList: true, subtree: true });
       }
-    } catch (e) {}
-    return origSend.apply(this, args);
+    },
+
+    toggle(force) {
+      this.open = (force === undefined) ? !this.open : force;
+      this.card.style.display = this.open ? 'flex' : 'none';
+      this.button.classList.toggle('xt-btn-active', this.open);
+    },
+
+    // 重建开关列表（设置变化时调用）
+    refresh() {
+      const list = this.card.querySelector('.xt-list');
+      if (!list) return;
+      list.innerHTML = '';
+      features.forEach(f => list.appendChild(buildToggleRow(f)));
+    },
   };
 
-  /* ---------- 2. 兜底链路：多来源逐个尝试 ---------- */
+  // 功能注册表：每个功能 { key, label, desc, get, set, onToggle }
+  const features = [];
 
-  function calcToken(id) {
-    // Twitter 嵌入接口的 token 算法（公开算法，多个开源项目在用）
-    return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
-  }
+  function registerFeature(f) { features.push(f); }
 
-  function gmGetJson(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        timeout: 20000,
-        onload: (r) => {
-          if (r.status < 200 || r.status >= 300) {
-            reject(new Error(`HTTP ${r.status}`));
-            return;
-          }
-          try { resolve(JSON.parse(r.responseText)); }
-          catch (e) { reject(new Error('返回内容不是 JSON')); }
-        },
-        onerror: (r) => reject(new Error(`网络错误${r?.status ? ' HTTP ' + r.status : ''}`)),
-        ontimeout: () => reject(new Error('请求超时')),
-      });
+  function buildToggleRow(f) {
+    const row = document.createElement('div');
+    row.className = 'xt-row';
+    const on = f.get();
+    row.innerHTML =
+      '<div class="xt-row-text">' +
+        '<div class="xt-row-name">' + f.label + '</div>' +
+        '<div class="xt-row-desc">' + f.desc + '</div>' +
+      '</div>' +
+      '<div class="xt-switch' + (on ? ' on' : '') + '" role="switch" aria-checked="' + on + '">' +
+        '<div class="xt-knob"></div>' +
+      '</div>';
+    const sw = row.querySelector('.xt-switch');
+    sw.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const newVal = !f.get();
+      f.set(newVal);
+      sw.classList.toggle('on', newVal);
+      sw.setAttribute('aria-checked', newVal);
+      if (f.onToggle) f.onToggle(newVal);
+      console.log(PREFIX, f.label, '→', newVal);
     });
+    return row;
   }
 
-  function parseSyndication(json) {
-    const media = (json.mediaDetails || []).find(m => m.video_info);
-    const variants = media?.video_info?.variants || [];
-    const mp4s = variants
-      .filter(v => (v.type === 'video/mp4' || v.content_type === 'video/mp4') && (v.url || v.src))
-      .map(v => ({ url: v.url || v.src, bitrate: v.bitrate || 0 }))
-      .sort((a, b) => b.bitrate - a.bitrate);
-    if (!mp4s.length) throw new Error('接口返回中没有 MP4 源');
-    return mp4s;
-  }
-
-  function parseFxTwitter(json) {
-    const tweet = json.tweet || {};
-    const videos = tweet.media?.videos
-      || (tweet.media?.all || []).filter(m => m.type === 'video' || m.type === 'gif');
-    const mp4s = (videos || [])
-      .filter(v => v.url)
-      .map(v => ({ url: v.url, bitrate: (v.width || 0) * (v.height || 0) }))
-      .sort((a, b) => b.bitrate - a.bitrate);
-    if (!mp4s.length) throw new Error('接口返回中没有 MP4 源');
-    return mp4s;
-  }
-
-  async function fetchViaSyndication(tweetId) {
-    const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=zh-cn&token=${calcToken(tweetId)}`;
-    // 先试页面内 fetch（该接口面向第三方嵌入，通常允许跨域）
-    try {
-      const r = await fetch(url, { credentials: 'omit' });
-      if (r.ok) return parseSyndication(await r.json());
-      throw new Error(`HTTP ${r.status}`);
-    } catch (e) {
-      // 页面内请求失败再试 GM 通道（可绕过跨域限制）
-      const json = await gmGetJson(url);
-      return parseSyndication(json);
-    }
-  }
-
-  async function fetchViaFxTwitter(tweetId) {
-    const json = await gmGetJson(`https://api.fxtwitter.com/status/${tweetId}`);
-    return parseFxTwitter(json);
-  }
-
-  /**
-   * 按优先级尝试所有来源，返回 { variants, errors }
-   */
-  async function resolveVideo(tweetId) {
-    const cached = videoCache.get(tweetId);
-    if (cached) return { variants: cached, source: '页面缓存' };
-
-    const errors = [];
-    const sources = [
-      ['Syndication 接口', () => fetchViaSyndication(tweetId)],
-      ['FixTweet 接口', () => fetchViaFxTwitter(tweetId)],
-    ];
-    for (const [name, fn] of sources) {
-      try {
-        const variants = await fn();
-        videoCache.set(tweetId, variants);
-        return { variants, source: name };
-      } catch (e) {
-        errors.push(`${name}: ${e?.message || e}`);
-      }
-    }
-    return { variants: null, errors };
-  }
-
-  /* ---------- 3. 下载文件（多通道兜底） ---------- */
-
-  function saveBlob(blob, filename) {
-    const blobUrl = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = blobUrl;
-    a.download = filename;
-    a.style.display = 'none';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(blobUrl), 10000);
-  }
-
-  /* 通道 1：GM_download，走浏览器原生下载管理器，大文件最稳 */
-  function downloadViaGmDownload(url, filename) {
-    return new Promise((resolve, reject) => {
-      if (typeof GM_download !== 'function') {
-        reject(new Error('当前脚本管理器不支持 GM_download'));
-        return;
-      }
-      GM_download({
-        url,
-        name: filename,
-        headers: { 'Referer': 'https://x.com/' },
-        onload: () => resolve(),
-        onerror: (e) => reject(new Error('原生下载通道失败' + (e?.error ? `（${e.error}）` : ''))),
-        ontimeout: () => reject(new Error('原生下载通道超时')),
-      });
-    });
-  }
-
-  /* 通道 2：GM_xmlhttpRequest 拉 blob（带 Referer 头） */
-  function downloadViaGmXhr(url, filename) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET',
-        url,
-        responseType: 'blob',
-        headers: { 'Referer': 'https://x.com/' },
-        timeout: 180000,
-        onload: (r) => {
-          if (r.status < 200 || r.status >= 300) {
-            reject(new Error(`HTTP ${r.status}`));
-            return;
-          }
-          try { saveBlob(r.response, filename); resolve(); }
-          catch (e) { reject(e); }
-        },
-        onerror: (r) => reject(new Error(`网络错误${r?.status ? ' HTTP ' + r.status : ''}`)),
-        ontimeout: () => reject(new Error('请求超时')),
-      });
-    });
-  }
-
-  /* 通道 3：页面内 fetch（video.twimg.com 通常允许跨域读取） */
-  async function downloadViaPageFetch(url, filename) {
-    const r = await fetch(url, { credentials: 'omit' });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    saveBlob(await r.blob(), filename);
-  }
-
-  /**
-   * 依次尝试所有下载通道，全部失败才报错。
-   * 最后的保底：直接新标签页打开视频，由用户 Ctrl+S 保存。
-   */
-  async function downloadWithFallback(url, filename) {
-    const errors = [];
-    const channels = [
-      ['浏览器原生下载', () => downloadViaGmDownload(url, filename)],
-      ['脚本请求通道', () => downloadViaGmXhr(url, filename)],
-      ['页面请求通道', () => downloadViaPageFetch(url, filename)],
-    ];
-    for (const [name, fn] of channels) {
-      try {
-        await fn();
-        console.debug('[X-Tools] 下载成功，通道:', name);
-        return { ok: true };
-      } catch (e) {
-        errors.push(`${name}: ${e?.message || e}`);
-      }
-    }
-    // 保底：新标签页打开，浏览器会直接播放/下载
-    window.open(url, '_blank', 'noopener');
-    return { ok: false, errors };
-  }
-
-  /* ---------- 4. 按钮 UI（加大醒目版） ---------- */
-
-  function injectStyle() {
-    if (document.getElementById('tvd-style')) return;
+  function injectPanelStyle() {
+    if (document.getElementById('xt-style')) return;
     const style = document.createElement('style');
-    style.id = 'tvd-style';
+    style.id = 'xt-style';
     style.textContent = `
-      .tvd-btn {
-        display: inline-flex; align-items: center; justify-content: center;
-        gap: 6px; height: 40px; padding: 0 14px; margin: -6px 0 -6px 4px;
-        border: 1.5px solid rgb(83, 100, 113); border-radius: 9999px;
-        background: transparent; color: rgb(231, 233, 234);
-        font-size: 14px; font-weight: 700; font-family: inherit;
-        cursor: pointer; white-space: nowrap;
-        transition: background-color 0.2s, color 0.2s, border-color 0.2s;
+      /* 悬浮按钮 */
+      .xt-fab {
+        position: fixed; right: 16px; bottom: 96px; z-index: 2147483646;
+        width: 48px; height: 48px; border-radius: 50%;
+        background: rgba(29, 155, 240, 0.92);
+        border: 2px solid rgba(255,255,255,0.18);
+        color: #fff; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 4px 14px rgba(0,0,0,0.4);
+        transition: transform 0.15s, box-shadow 0.15s, background 0.15s;
+        backdrop-filter: blur(6px);
       }
-      .tvd-btn:hover {
-        background-color: rgba(29, 155, 240, 0.15);
-        border-color: rgb(29, 155, 240);
-        color: rgb(29, 155, 240);
+      .xt-fab:hover { transform: scale(1.08); box-shadow: 0 6px 20px rgba(29,155,240,0.5); }
+      .xt-fab:active { transform: scale(0.96); }
+      .xt-fab.xt-btn-active { background: rgb(29, 155, 240); box-shadow: 0 6px 20px rgba(29,155,240,0.6); }
+      /* 面板卡片 */
+      .xt-card {
+        position: fixed; right: 16px; bottom: 152px; z-index: 2147483647;
+        width: 300px; display: none; flex-direction: column;
+        background: rgba(21, 24, 28, 0.96);
+        border: 1px solid rgba(255,255,255,0.1);
+        border-radius: 16px;
+        box-shadow: 0 12px 40px rgba(0,0,0,0.55);
+        backdrop-filter: blur(16px);
+        color: rgb(231, 233, 234);
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        overflow: hidden;
+        animation: xt-pop 0.16s ease-out;
       }
-      .tvd-btn:disabled { cursor: wait; opacity: 0.75; }
-      .tvd-spin { animation: tvd-rotate 0.8s linear infinite; }
-      @keyframes tvd-rotate { to { transform: rotate(360deg); } }
+      @keyframes xt-pop { from { opacity: 0; transform: translateY(8px) scale(0.98); } to { opacity: 1; transform: none; } }
+      .xt-head {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 14px 16px; border-bottom: 1px solid rgba(255,255,255,0.08);
+      }
+      .xt-title { font-size: 15px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+      .xt-title-dot { width: 8px; height: 8px; border-radius: 50%; background: rgb(29, 155, 240); }
+      .xt-close {
+        width: 24px; height: 24px; border-radius: 50%; border: none; cursor: pointer;
+        background: rgba(255,255,255,0.08); color: rgb(231, 233, 234);
+        font-size: 16px; line-height: 1; display: flex; align-items: center; justify-content: center;
+      }
+      .xt-close:hover { background: rgba(255,255,255,0.16); }
+      .xt-list { padding: 8px 0; max-height: 60vh; overflow-y: auto; }
+      .xt-row {
+        display: flex; align-items: center; justify-content: space-between;
+        padding: 10px 16px; cursor: pointer; transition: background 0.12s;
+      }
+      .xt-row:hover { background: rgba(255,255,255,0.04); }
+      .xt-row-text { flex: 1; min-width: 0; }
+      .xt-row-name { font-size: 14px; font-weight: 600; }
+      .xt-row-desc { font-size: 12px; color: rgb(113, 118, 123); margin-top: 2px; }
+      /* iOS 风格开关 */
+      .xt-switch {
+        flex-shrink: 0; width: 38px; height: 22px; border-radius: 11px;
+        background: rgb(83, 100, 113); position: relative; transition: background 0.18s;
+        cursor: pointer;
+      }
+      .xt-switch.on { background: rgb(29, 155, 240); }
+      .xt-knob {
+        position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+        border-radius: 50%; background: #fff;
+        transition: transform 0.18s; box-shadow: 0 1px 3px rgba(0,0,0,0.4);
+      }
+      .xt-switch.on .xt-knob { transform: translateX(16px); }
+      .xt-foot {
+        padding: 10px 16px; border-top: 1px solid rgba(255,255,255,0.08);
+        font-size: 11px; color: rgb(113, 118, 123);
+        display: flex; justify-content: space-between; align-items: center;
+      }
+      .xt-foot a { color: rgb(29, 155, 240); text-decoration: none; }
+      .xt-foot a:hover { text-decoration: underline; }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
 
-  const ICON_DOWNLOAD = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M12 15.586l-4.293-4.293 1.414-1.414L11 11.758V3h2v8.758l1.879-1.879 1.414 1.414L12 15.586zM5 19h14v2H5v-2z"/></svg>';
-  const ICON_LOADING = '<svg class="tvd-spin" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-opacity="0.25"/><path d="M21 12a9 9 0 0 0-9-9"/></svg>';
+  // 悬浮按钮上的图标（滑块/工具感）
+  const FAB_ICON = '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true">'
+    + '<path d="M12 2l2.4 4.8 5.3.8-3.8 3.7.9 5.3L12 14.9 7.2 17.6l.9-5.3L4.3 8.6l5.3-.8L12 2z"/>'
+    + '</svg>';
+  // 简化：用一个齿轮+星 的混合，实际用滑块图标更贴"工具开关"
+  const FAB_ICON_SLIDER = '<svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">'
+    + '<line x1="4" y1="8" x2="20" y2="8"/><circle cx="9" cy="8" r="2.2" fill="currentColor"/>'
+    + '<line x1="4" y1="16" x2="20" y2="16"/><circle cx="15" cy="16" r="2.2" fill="currentColor"/>'
+    + '</svg>';
 
-  function getTweetId(article) {
-    const links = article.querySelectorAll('a[href*="/status/"]');
-    for (const a of links) {
-      const m = (a.getAttribute('href') || '').match(/\/status\/(\d+)/);
-      if (m) return m[1];
-    }
-    return null;
-  }
-
-  function articleHasVideo(article) {
-    return !!article.querySelector(
-      'video, [data-testid="videoPlayer"], [data-testid="videoComponent"], [data-testid="playButton"]'
-    );
-  }
-
-  async function handleDownload(btn, tweetId) {
-    btn.disabled = true;
-    btn.innerHTML = ICON_LOADING + '<span>下载中</span>';
-    try {
-      const { variants, errors } = await resolveVideo(tweetId);
-      if (!variants) {
-        alert(
-          '未能获取到视频地址：\n\n' + errors.join('\n') +
-          '\n\n可尝试：\n' +
-          '1. 刷新页面，让这条推文重新加载后再点下载；\n' +
-          '2. 点开推文详情页再下载；\n' +
-          '3. 涉及敏感/受限内容的推文可能需要登录后的会话才能解析；\n' +
-          '4. 仅含 m3u8 流的视频可用 yt-dlp 命令行下载。'
-        );
-        return;
-      }
-      const best = variants[0];
-      const result = await downloadWithFallback(best.url, genFilename());
-      if (!result.ok) {
-        alert(
-          '自动下载通道均未成功，已在新标签页中打开视频，可在新标签页里右键 / Ctrl+S 保存。\n\n' +
-          '各通道失败原因：\n' + result.errors.join('\n') +
-          '\n\n提示：HTTP 408 / 超时类错误通常与代理节点到 Twitter 视频服务器的连接质量有关，可切换节点后重试。'
-        );
-      }
-    } catch (e) {
-      alert('下载失败：' + (e?.message || e));
-    } finally {
-      btn.disabled = false;
-      btn.innerHTML = ICON_DOWNLOAD + '<span>下载</span>';
-    }
-  }
-
-  function addButton(article) {
-    if (article.querySelector('.tvd-btn')) return;
-    const group = article.querySelector('div[role="group"]');
-    if (!group) return;
-    const tweetId = getTweetId(article);
-    if (!tweetId) return;
-    // 只给含视频的推文加按钮（已缓存到视频地址的也算）
-    if (!articleHasVideo(article) && !videoCache.has(tweetId)) return;
-
-    injectStyle();
+  function createButton() {
     const btn = document.createElement('button');
-    btn.className = 'tvd-btn';
+    btn.className = 'xt-fab';
     btn.type = 'button';
-    btn.title = '下载视频（最高画质）';
-    btn.setAttribute('aria-label', '下载视频');
-    btn.innerHTML = ICON_DOWNLOAD + '<span>下载</span>';
-    btn.addEventListener('click', (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      handleDownload(btn, tweetId);
+    btn.title = 'X Tools 推特小工具';
+    btn.setAttribute('aria-label', 'X Tools 面板');
+    btn.innerHTML = FAB_ICON_SLIDER;
+    return btn;
+  }
+
+  function createCard() {
+    const card = document.createElement('div');
+    card.className = 'xt-card';
+    card.innerHTML =
+      '<div class="xt-head">' +
+        '<div class="xt-title"><span class="xt-title-dot"></span>X Tools 推特小工具</div>' +
+        '<button class="xt-close" type="button" aria-label="关闭">×</button>' +
+      '</div>' +
+      '<div class="xt-list"></div>' +
+      '<div class="xt-foot">' +
+        '<span>v1.4.0</span>' +
+        '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
+      '</div>';
+    card.querySelector('.xt-close').addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      Panel.toggle(false);
     });
-    // 插到操作栏末尾
-    const holder = document.createElement('div');
-    holder.style.display = 'flex';
-    holder.appendChild(btn);
-    group.appendChild(holder);
+    // 阻止面板内点击冒泡触发外层关闭
+    card.addEventListener('click', (e) => e.stopPropagation());
+    return card;
   }
 
-  /* ---------- 5. 监听时间线，自动加按钮 ---------- */
+  /* ============================================================
+   * 3. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，防封号）
+   * 原则：只在前端隐藏 HTML，不拦截网络请求、不模拟点击举报/拉黑，
+   *       X 服务端完全感知不到，不触发风控。
+   * 识别：X 给广告推文打了 [data-testid="placementTracking"] 追踪标记，
+   *       命中即隐藏整条推文。
+   * ============================================================ */
 
-  let scanTimer = null;
-  function scheduleScan() {
-    if (scanTimer) return;
-    scanTimer = setTimeout(() => {
-      scanTimer = null;
-      document.querySelectorAll('article[data-testid="tweet"]').forEach(addButton);
-    }, 150);
-  }
+  const AdBlocker = {
+    observer: null,
+    enabled: false,
 
-  function startObserver() {
-    scheduleScan();
-    new MutationObserver(scheduleScan).observe(document.body, {
-      childList: true,
-      subtree: true,
-    });
-  }
+    init() {
+      registerFeature({
+        key: 'hideAds',
+        label: '广告屏蔽',
+        desc: '隐藏推广推文（纯前端，不影响账号）',
+        get: () => Settings.get('hideAds'),
+        set: (v) => Settings.set('hideAds', v),
+        onToggle: (v) => this.setEnabled(v),
+      });
+      this.setEnabled(Settings.get('hideAds'));
+    },
 
-  if (document.body) {
-    startObserver();
-  } else {
-    new MutationObserver((_, obs) => {
-      if (document.body) {
-        obs.disconnect();
-        startObserver();
+    setEnabled(on) {
+      this.enabled = on;
+      if (on) this.start();
+      else this.stop();
+    },
+
+    start() {
+      if (this.observer) return;
+      const scan = () => this.scan(document);
+      // 先扫一次已有内容
+      if (document.body) scan();
+      this.observer = new MutationObserver((muts) => {
+        if (!this.enabled) return;
+        for (const m of muts) {
+          for (const n of m.addedNodes) {
+            if (n.nodeType === 1) this.scan(n);
+          }
+        }
+      });
+      if (document.body) this.observer.observe(document.body, { childList: true, subtree: true });
+      else {
+        const o = new MutationObserver(() => {
+          if (document.body) { o.disconnect(); scan(); this.observer.observe(document.body, { childList: true, subtree: true }); }
+        });
+        o.observe(document.documentElement, { childList: true, subtree: true });
       }
-    }).observe(document.documentElement, { childList: true, subtree: true });
+    },
+
+    stop() {
+      if (this.observer) { this.observer.disconnect(); this.observer = null; }
+      // 已隐藏的不恢复（避免布局抖动），刷新页面后自然恢复
+    },
+
+    // 在节点范围内找推广推文并隐藏
+    scan(root) {
+      try {
+        // placementTracking 是 X 专给广告位打的追踪容器，稳定可靠
+        const tracks = root.querySelectorAll ?
+          root.querySelectorAll('[data-testid="placementTracking"]') : [];
+        for (const t of tracks) {
+          // 向上找到推文滚动单元（cellInnerDiv）或 article，整条隐藏
+          const cell = t.closest('div[data-testid="cellInnerDiv"]') ||
+                       t.closest('article[data-testid="tweet"]') ||
+                       t.closest('article');
+          if (cell && cell.style.display !== 'none') {
+            cell.style.display = 'none';
+            console.debug(PREFIX, '已隐藏推广推文');
+          }
+        }
+      } catch (e) { /* 忽略 */ }
+    },
+  };
+
+  /* ============================================================
+   * 4. VideoDL —— 推文视频下载（原有逻辑，保留）
+   * ============================================================ */
+
+  const VideoDL = {
+    observer: null,
+    enabled: false,
+    videoCache: new Map(),
+
+    init() {
+      // hook GraphQL 已在 document-start 阶段单独调用（见文件末尾），此处不再重复
+      this.injectButtonStyle();
+      registerFeature({
+        key: 'videoDownload',
+        label: '视频下载',
+        desc: '推文操作栏加下载按钮（最高画质 MP4）',
+        get: () => Settings.get('videoDownload'),
+        set: (v) => Settings.set('videoDownload', v),
+        onToggle: (v) => this.setEnabled(v),
+      });
+      this.setEnabled(Settings.get('videoDownload'));
+    },
+
+    setEnabled(on) {
+      this.enabled = on;
+      if (on) this.startObserver();
+      else this.stopObserver();
+    },
+
+    startObserver() {
+      if (this.observer) return;
+      const schedule = () => {
+        if (this._t) return;
+        this._t = setTimeout(() => {
+          this._t = null;
+          document.querySelectorAll('article[data-testid="tweet"]').forEach(a => this.addButton(a));
+        }, 150);
+      };
+      schedule();
+      this.observer = new MutationObserver(schedule);
+      if (document.body) this.observer.observe(document.body, { childList: true, subtree: true });
+      else {
+        const o = new MutationObserver(() => {
+          if (document.body) { o.disconnect(); schedule(); this.observer.observe(document.body, { childList: true, subtree: true }); }
+        });
+        o.observe(document.documentElement, { childList: true, subtree: true });
+      }
+    },
+
+    stopObserver() {
+      if (this.observer) { this.observer.disconnect(); this.observer = null; }
+      // 移除已注入的按钮
+      document.querySelectorAll('.tvd-btn').forEach(b => b.closest('.tvd-holder')?.remove() || b.remove());
+    },
+
+    hookNetwork() {
+      const API_PATTERN = /\/i\/api\/graphql\//;
+      const extractFromJson = (json) => {
+        try {
+          (function walk(node) {
+            if (!node || typeof node !== 'object') return;
+            const media = node.extended_entities?.media || node.entities?.media;
+            if (Array.isArray(media)) {
+              for (const m of media) {
+                const variants = m.video_info?.variants;
+                if (!Array.isArray(variants)) continue;
+                const mp4s = variants
+                  .filter(v => v.content_type === 'video/mp4' && v.url)
+                  .map(v => ({ url: v.url, bitrate: v.bitrate || 0 }))
+                  .sort((a, b) => b.bitrate - a.bitrate);
+                if (!mp4s.length) continue;
+                const id = node.rest_id || node.legacy?.id_str;
+                if (id && /^\d+$/.test(String(id))) {
+                  VideoDL.videoCache.set(String(id), mp4s);
+                  console.debug(PREFIX, '已捕获视频:', id);
+                }
+              }
+            }
+            for (const k of Object.keys(node)) {
+              const c = node[k];
+              if (c && typeof c === 'object') walk(c);
+            }
+          })(json);
+        } catch (e) {}
+      };
+
+      const origFetch = w.fetch;
+      w.fetch = function (...args) {
+        const p = origFetch.apply(this, args);
+        try {
+          const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+          if (API_PATTERN.test(url)) {
+            p.then(res => res.clone().text().then(t => { try { extractFromJson(JSON.parse(t)); } catch (e) {} }).catch(() => {})).catch(() => {});
+          }
+        } catch (e) {}
+        return p;
+      };
+      const origOpen = w.XMLHttpRequest.prototype.open;
+      const origSend = w.XMLHttpRequest.prototype.send;
+      w.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+        this.__xtUrl = url;
+        return origOpen.call(this, method, url, ...rest);
+      };
+      w.XMLHttpRequest.prototype.send = function (...args) {
+        try {
+          if (API_PATTERN.test(this.__xtUrl || '')) {
+            this.addEventListener('load', function () {
+              try { extractFromJson(JSON.parse(this.responseText)); } catch (e) {}
+            });
+          }
+        } catch (e) {}
+        return origSend.apply(this, args);
+      };
+    },
+
+    injectButtonStyle() {
+      if (document.getElementById('tvd-style')) return;
+      const style = document.createElement('style');
+      style.id = 'tvd-style';
+      style.textContent = `
+        .tvd-btn {
+          display: inline-flex; align-items: center; justify-content: center;
+          gap: 6px; height: 40px; padding: 0 14px; margin: -6px 0 -6px 4px;
+          border: 1.5px solid rgb(83, 100, 113); border-radius: 9999px;
+          background: transparent; color: rgb(231, 233, 234);
+          font-size: 14px; font-weight: 700; font-family: inherit;
+          cursor: pointer; white-space: nowrap;
+          transition: background-color 0.2s, color 0.2s, border-color 0.2s;
+        }
+        .tvd-btn:hover {
+          background-color: rgba(29, 155, 240, 0.15);
+          border-color: rgb(29, 155, 240);
+          color: rgb(29, 155, 240);
+        }
+        .tvd-btn:disabled { cursor: wait; opacity: 0.75; }
+        .tvd-spin { animation: tvd-rotate 0.8s linear infinite; }
+        @keyframes tvd-rotate { to { transform: rotate(360deg); } }
+      `;
+      (document.head || document.documentElement).appendChild(style);
+    },
+
+    genFilename() {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}_${Math.random().toString(36).slice(2,8)}.mp4`;
+    },
+
+    ICON_DOWNLOAD: '<svg viewBox="0 0 24 24" width="22" height="22" fill="currentColor" aria-hidden="true"><path d="M12 15.586l-4.293-4.293 1.414-1.414L11 11.758V3h2v8.758l1.879-1.879 1.414 1.414L12 15.586zM5 19h14v2H5v-2z"/></svg>',
+    ICON_LOADING: '<svg class="tvd-spin" viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor" stroke-width="2.5" aria-hidden="true"><circle cx="12" cy="12" r="9" stroke-opacity="0.25"/><path d="M21 12a9 9 0 0 0-9-9"/></svg>',
+
+    getTweetId(article) {
+      for (const a of article.querySelectorAll('a[href*="/status/"]')) {
+        const m = (a.getAttribute('href') || '').match(/\/status\/(\d+)/);
+        if (m) return m[1];
+      }
+      return null;
+    },
+
+    hasVideo(article) {
+      return !!article.querySelector('video, [data-testid="videoPlayer"], [data-testid="videoComponent"], [data-testid="playButton"]');
+    },
+
+    addButton(article) {
+      if (article.querySelector('.tvd-btn')) return;
+      const group = article.querySelector('div[role="group"]');
+      if (!group) return;
+      const tweetId = this.getTweetId(article);
+      if (!tweetId) return;
+      if (!this.hasVideo(article) && !this.videoCache.has(tweetId)) return;
+      const btn = document.createElement('button');
+      btn.className = 'tvd-btn';
+      btn.type = 'button';
+      btn.title = '下载视频（最高画质）';
+      btn.setAttribute('aria-label', '下载视频');
+      btn.innerHTML = this.ICON_DOWNLOAD + '<span>下载</span>';
+      btn.addEventListener('click', (e) => {
+        e.preventDefault(); e.stopPropagation();
+        this.handleDownload(btn, tweetId);
+      });
+      const holder = document.createElement('div');
+      holder.className = 'tvd-holder';
+      holder.style.display = 'flex';
+      holder.appendChild(btn);
+      group.appendChild(holder);
+    },
+
+    async handleDownload(btn, tweetId) {
+      btn.disabled = true;
+      btn.innerHTML = this.ICON_LOADING + '<span>下载中</span>';
+      try {
+        const { variants, errors } = await this.resolveVideo(tweetId);
+        if (!variants) {
+          alert('未能获取到视频地址：\n\n' + errors.join('\n') +
+            '\n\n可尝试：\n1. 刷新页面让推文重新加载；\n2. 点开推文详情页再下载；\n3. 敏感/受限内容需登录会话；\n4. 仅 m3u8 流可用 yt-dlp。');
+          return;
+        }
+        const result = await this.downloadWithFallback(variants[0].url, this.genFilename());
+        if (!result.ok) {
+          alert('自动下载通道均未成功，已在新标签页打开视频，可右键/Ctrl+S 保存。\n\n失败原因：\n' + result.errors.join('\n'));
+        }
+      } catch (e) {
+        alert('下载失败：' + (e?.message || e));
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = this.ICON_DOWNLOAD + '<span>下载</span>';
+      }
+    },
+
+    calcToken(id) {
+      return ((Number(id) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+    },
+
+    gmGetJson(url) {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: 'GET', url, timeout: 20000,
+          onload: (r) => {
+            if (r.status < 200 || r.status >= 300) { reject(new Error(`HTTP ${r.status}`)); return; }
+            try { resolve(JSON.parse(r.responseText)); } catch (e) { reject(new Error('返回非 JSON')); }
+          },
+          onerror: (r) => reject(new Error(`网络错误${r?.status ? ' HTTP ' + r.status : ''}`)),
+          ontimeout: () => reject(new Error('请求超时')),
+        });
+      });
+    },
+
+    async resolveVideo(tweetId) {
+      const cached = this.videoCache.get(tweetId);
+      if (cached) return { variants: cached };
+      const errors = [];
+      const sources = [
+        ['Syndication', async () => {
+          const url = `https://cdn.syndication.twimg.com/tweet-result?id=${tweetId}&lang=zh-cn&token=${this.calcToken(tweetId)}`;
+          try {
+            const r = await fetch(url, { credentials: 'omit' });
+            if (r.ok) return this.parseSyndication(await r.json());
+            throw new Error(`HTTP ${r.status}`);
+          } catch (e) {
+            return this.parseSyndication(await this.gmGetJson(url));
+          }
+        }],
+        ['FixTweet', async () => this.parseFxTwitter(await this.gmGetJson(`https://api.fxtwitter.com/status/${tweetId}`))],
+      ];
+      for (const [name, fn] of sources) {
+        try {
+          const variants = await fn();
+          this.videoCache.set(tweetId, variants);
+          return { variants };
+        } catch (e) { errors.push(`${name}: ${e?.message || e}`); }
+      }
+      return { variants: null, errors };
+    },
+
+    parseSyndication(json) {
+      const media = (json.mediaDetails || []).find(m => m.video_info);
+      const variants = media?.video_info?.variants || [];
+      const mp4s = variants.filter(v => (v.type === 'video/mp4' || v.content_type === 'video/mp4') && (v.url || v.src))
+        .map(v => ({ url: v.url || v.src, bitrate: v.bitrate || 0 })).sort((a, b) => b.bitrate - a.bitrate);
+      if (!mp4s.length) throw new Error('无 MP4 源');
+      return mp4s;
+    },
+
+    parseFxTwitter(json) {
+      const tweet = json.tweet || {};
+      const videos = tweet.media?.videos || (tweet.media?.all || []).filter(m => m.type === 'video' || m.type === 'gif');
+      const mp4s = (videos || []).filter(v => v.url)
+        .map(v => ({ url: v.url, bitrate: (v.width || 0) * (v.height || 0) })).sort((a, b) => b.bitrate - a.bitrate);
+      if (!mp4s.length) throw new Error('无 MP4 源');
+      return mp4s;
+    },
+
+    saveBlob(blob, filename) {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url; a.download = filename; a.style.display = 'none';
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 10000);
+    },
+
+    async downloadWithFallback(url, filename) {
+      const errors = [];
+      const channels = [
+        ['GM_download', () => new Promise((resolve, reject) => {
+          if (typeof GM_download !== 'function') { reject(new Error('不支持 GM_download')); return; }
+          GM_download({
+            url, name: filename, headers: { 'Referer': 'https://x.com/' },
+            onload: () => resolve(), onerror: (e) => reject(new Error('原生下载失败' + (e?.error ? `(${e.error})` : ''))),
+            ontimeout: () => reject(new Error('原生下载超时')),
+          });
+        })],
+        ['GM_xhr', () => new Promise((resolve, reject) => {
+          GM_xmlhttpRequest({
+            method: 'GET', url, responseType: 'blob', headers: { 'Referer': 'https://x.com/' }, timeout: 180000,
+            onload: (r) => {
+              if (r.status < 200 || r.status >= 300) { reject(new Error(`HTTP ${r.status}`)); return; }
+              try { this.saveBlob(r.response, filename); resolve(); } catch (e) { reject(e); }
+            },
+            onerror: (r) => reject(new Error(`网络错误${r?.status ? ' HTTP ' + r.status : ''}`)),
+            ontimeout: () => reject(new Error('请求超时')),
+          });
+        })],
+        ['pageFetch', async () => {
+          const r = await fetch(url, { credentials: 'omit' });
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          this.saveBlob(await r.blob(), filename);
+        }],
+      ];
+      for (const [name, fn] of channels) {
+        try { await fn(); console.debug(PREFIX, '下载成功，通道:', name); return { ok: true }; }
+        catch (e) { errors.push(`${name}: ${e?.message || e}`); }
+      }
+      window.open(url, '_blank', 'noopener');
+      return { ok: false, errors };
+    },
+  };
+
+  /* ============================================================
+   * 启动
+   * ============================================================ */
+
+  function boot() {
+    // 各模块初始化（注册功能开关）
+    AdBlocker.init();
+    VideoDL.init();
+    // 面板最后初始化（需要 features 已注册）
+    Panel.init();
+    // 面板里填开关
+    Panel.refresh();
+    console.log(PREFIX, '已启动 v1.4.0');
+  }
+
+  // document-start 期 hook 网络要尽早，但 DOM 操作需等 body
+  VideoDL.hookNetwork();
+  if (document.body) boot();
+  else {
+    const obs = new MutationObserver(() => {
+      if (document.body) { obs.disconnect(); boot(); }
+    });
+    obs.observe(document.documentElement, { childList: true, subtree: true });
   }
 })();
