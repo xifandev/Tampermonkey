@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.4.2
+// @version      1.4.3
 // @description  推特小工具集：视频一键下载、广告屏蔽、悬浮控制面板，功能持续增加
 // @author       xifan
 // @license      MIT
@@ -92,13 +92,22 @@
         document.addEventListener('keydown', (e) => {
           if (e.key === 'Escape' && this.open) this.toggle(false);
         });
-        // 守卫：X 是 SPA，官方按钮位置可能动态变化，定期重新跟随定位
-        const rePosition = () => positionFab(this.button);
+        // 守卫：X 是 SPA，官方按钮位置可能动态变化。
+        // 逐帧跟随坐标（仅在变化时写样式），官方按钮渲染/动画一结束立即就位；
+        // 定时器只负责按钮被 X 移除后的重挂载和主题变化后的样式刷新。
+        const mountedAt = performance.now();
+        const rePosition = () => {
+          const ok = positionFab(this.button);
+          // 长时间找不到官方按钮（如未登录页），退回默认固定位置，保证入口不丢
+          if (!ok && performance.now() - mountedAt > 15000) fallbackFab(this.button);
+          if (this.open) this.positionCard();
+        };
+        const track = () => { rePosition(); requestAnimationFrame(track); };
+        requestAnimationFrame(track);
         setInterval(() => {
           if (!document.body.contains(this.button)) mountFab(this.button);
-          else rePosition();
+          else positionFab(this.button, true);
         }, 2000);
-        window.addEventListener('resize', rePosition);
       };
       if (document.body) mount();
       else {
@@ -178,13 +187,6 @@
       .xt-fab:hover { transform: scale(1.06); filter: brightness(1.3); }
       .xt-fab:active { transform: scale(0.95); }
       .xt-fab.xt-btn-active { filter: brightness(1.4); }
-      /* 探测条（临时，拿结构后删） */
-      .xt-probe {
-        position: fixed; top: 4px; left: 50%; transform: translateX(-50%);
-        z-index: 2147483647; width: 70%; padding: 4px 8px;
-        background: #ffe600; color: #000; font-size: 10px; font-family: monospace;
-        border: 1px solid #000; border-radius: 4px;
-      }
       /* 面板卡片 */
       .xt-card {
         position: fixed; z-index: 2147483647;
@@ -264,63 +266,65 @@
   // 悬浮按钮定位：不插入 X 容器，改用"动态跟随 Grok 按钮真实坐标"。
   // 尺寸/圆角/背景/阴影直接复制 Grok 的 computed style，位置 = Grok 正上方，
   // 间距取 Grok 与聊天按钮的真实间距——全程不硬编码任何数值，X 改版也不失效。
-  function positionFab(btn) {
+  // 官方按钮未渲染或还在入场动画（坐标无效）时先隐藏，避免刷新初期错位闪现。
+  const fabState = { grok: null, key: '' };
+
+  function positionFab(btn, forceStyle) {
     const grok = document.querySelector('button[aria-label="Grok"]');
-    const chat = document.querySelector('button[aria-label="聊天"]');
-    if (!grok) {
-      // 兜底：找不到官方按钮，用默认固定位置
-      btn.style.width = '50px'; btn.style.height = '50px';
-      btn.style.borderRadius = '16px';
-      btn.style.background = 'rgba(22, 24, 28, 0.96)'; btn.style.color = '#fff';
-      btn.style.border = '1px solid rgba(255,255,255,0.16)';
-      btn.style.boxShadow = '0 0 14px rgba(255,255,255,0.10), 0 4px 14px rgba(0,0,0,0.45)';
-      btn.style.right = '16px'; btn.style.bottom = '96px';
-      return;
+    const r = grok && grok.getBoundingClientRect();
+    const valid = r && r.width > 0 && r.height > 0 &&
+      r.left >= 0 && r.top >= 0 &&
+      r.right <= window.innerWidth && r.bottom <= window.innerHeight;
+    if (!valid) {
+      btn.style.visibility = 'hidden';
+      fabState.grok = null; fabState.key = '';
+      return false;
     }
-    const r = grok.getBoundingClientRect();
-    const cs = getComputedStyle(grok);
-    btn.style.width = r.width + 'px';
-    btn.style.height = r.height + 'px';
-    btn.style.borderRadius = cs.borderRadius;
-    btn.style.background = cs.backgroundColor;
-    btn.style.color = cs.color;
-    btn.style.boxShadow = cs.boxShadow;
-    btn.style.borderTop = cs.borderTop; btn.style.borderRight = cs.borderRight;
-    btn.style.borderBottom = cs.borderBottom; btn.style.borderLeft = cs.borderLeft;
+    const chat = document.querySelector(
+      'button[aria-label="聊天"], button[aria-label="消息"], button[aria-label="Chat"], button[aria-label="Messages"]');
     // 间距 = Grok 与聊天按钮的真实间距（动态测量，不写死）
     let gap = 12;
     if (chat) {
       const cr = chat.getBoundingClientRect();
       if (cr.top > r.bottom) gap = Math.max(6, cr.top - r.bottom);
     }
-    btn.style.right = (window.innerWidth - r.right) + 'px';
-    btn.style.bottom = (window.innerHeight - r.top + gap) + 'px';
+    const right = window.innerWidth - r.right;
+    const bottom = window.innerHeight - r.top + gap;
+    const key = [right, bottom, r.width, r.height].join(',');
+    // 坐标没变就不写样式，避免逐帧触发重排
+    if (grok !== fabState.grok || key !== fabState.key || forceStyle) {
+      const cs = getComputedStyle(grok);
+      btn.style.width = r.width + 'px';
+      btn.style.height = r.height + 'px';
+      btn.style.borderRadius = cs.borderRadius;
+      btn.style.background = cs.backgroundColor;
+      btn.style.color = cs.color;
+      btn.style.boxShadow = cs.boxShadow;
+      btn.style.borderTop = cs.borderTop; btn.style.borderRight = cs.borderRight;
+      btn.style.borderBottom = cs.borderBottom; btn.style.borderLeft = cs.borderLeft;
+      btn.style.right = right + 'px';
+      btn.style.bottom = bottom + 'px';
+      fabState.grok = grok; fabState.key = key;
+    }
+    btn.style.visibility = 'visible';
+    return true;
+  }
+
+  // 兜底：页面上确实没有官方按钮时的默认固定位置
+  function fallbackFab(btn) {
+    btn.style.width = '50px'; btn.style.height = '50px';
+    btn.style.borderRadius = '16px';
+    btn.style.background = 'rgba(22, 24, 28, 0.96)'; btn.style.color = '#fff';
+    btn.style.border = '1px solid rgba(255,255,255,0.16)';
+    btn.style.boxShadow = '0 0 14px rgba(255,255,255,0.10), 0 4px 14px rgba(0,0,0,0.45)';
+    btn.style.right = '16px'; btn.style.bottom = '96px';
+    btn.style.visibility = 'visible';
   }
 
   function mountFab(btn) {
     if (!document.body.contains(btn)) document.body.appendChild(btn);
     positionFab(btn);
     console.log(PREFIX, '悬浮按钮已挂载（跟随官方坐标）');
-  }
-
-  // 临时探测：把 Grok 按钮的祖先链结构输出，便于精确优化（下一版删除）
-  function probeDom() {
-    try {
-      const g = document.querySelector('button[aria-label="Grok"]');
-      if (!g) return;
-      const lines = [];
-      let e = g;
-      for (let i = 0; e && i < 7 && e !== document.body; i++, e = e.parentElement) {
-        const c = getComputedStyle(e), r = e.getBoundingClientRect();
-        const cls = String(e.className || '').split(' ').slice(0, 3).join(' ');
-        lines.push(`[${i}]${e.tagName.toLowerCase()} testid=${e.getAttribute('data-testid') || '-'} cls="${cls}" pos=${c.position} disp=${c.display} dir=${c.flexDirection} gap=${c.gap} kids=${e.children.length} rect=${Math.round(r.width)}x${Math.round(r.height)}`);
-      }
-      const txt = 'PROBE::' + lines.join(' ~ ');
-      document.title = txt;
-      const inp = document.createElement('input');
-      inp.className = 'xt-probe'; inp.readOnly = true; inp.value = txt;
-      document.body.appendChild(inp);
-    } catch (e) {}
   }
 
   function createCard() {
@@ -333,7 +337,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.4.2</span>' +
+        '<span>v1.4.3</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -750,8 +754,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    probeDom(); // 临时：探测官方悬浮按钮 DOM 结构
-    console.log(PREFIX, '已启动 v1.4.2');
+    console.log(PREFIX, '已启动 v1.4.3');
   }
 
   // document-start 期 hook 网络要尽早，但 DOM 操作需等 body
