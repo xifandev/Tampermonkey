@@ -1,0 +1,17 @@
+# 编辑器临时文件
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.code-workspace
+
+# 依赖
+node_modules/
+
+# 日志
+*.log
