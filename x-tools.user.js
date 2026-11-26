@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.4.3
-// @description  推特小工具集：视频一键下载、广告屏蔽、悬浮控制面板，功能持续增加
+// @version      1.5.0
+// @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
 // @match        https://x.com/*
@@ -33,8 +33,10 @@
    * 模块结构：
    *   1. Settings  —— 开关持久化（GM 存储）
    *   2. Panel     —— 悬浮按钮 + 浮窗控制面板
-   *   3. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，零网络拦截，防封号）
-   *   4. VideoDL   —— 推文视频下载（hook GraphQL + 多源兜底）
+   *   3. ApiHub    —— 共享网络 Hook（一次解析，多模块消费）
+   *   4. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，零网络拦截，防封号）
+   *   5. VideoDL   —— 推文视频下载（hook GraphQL + 多源兜底）
+   *   6. Follow    —— 时间线关注状态 + 手动一键关注
    * ============================================================ */
 
   const w = (typeof unsafeWindow !== 'undefined') ? unsafeWindow : window;
@@ -48,6 +50,7 @@
     defaults: {
       hideAds: true,        // 广告屏蔽
       videoDownload: true,  // 视频下载按钮
+      quickFollow: true,    // 时间线关注状态与一键关注
     },
     get(key) {
       const v = GM_getValue('xt_' + key, undefined);
@@ -337,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.4.3</span>' +
+        '<span>v1.5.0</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -350,7 +353,117 @@
   }
 
   /* ============================================================
-   * 3. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，防封号）
+   * 3. ApiHub —— 共享网络 Hook
+   * 所有模块共用一次响应读取/JSON 解析，避免重复包装 fetch 和 XHR。
+   * 同时只在内存中捕获页面自己的认证头，供用户主动操作时使用。
+   * ============================================================ */
+
+  const ApiHub = {
+    listeners: new Set(),
+    originalFetch: null,
+    authorization: '',
+    csrfToken: '',
+    hooked: false,
+
+    addListener(fn) {
+      this.listeners.add(fn);
+    },
+
+    captureHeader(name, value) {
+      const key = String(name).toLowerCase();
+      if (key === 'authorization' && /^Bearer\s+/i.test(value)) {
+        this.authorization = value;
+      } else if (key === 'x-csrf-token' && value) {
+        this.csrfToken = value;
+      }
+    },
+
+    captureHeaders(headers) {
+      if (!headers) return;
+      try {
+        if (typeof headers.forEach === 'function') {
+          headers.forEach((value, key) => this.captureHeader(key, value));
+        } else if (Array.isArray(headers)) {
+          for (const pair of headers) {
+            if (pair && pair.length >= 2) this.captureHeader(pair[0], pair[1]);
+          }
+        } else {
+          for (const [key, value] of Object.entries(headers)) this.captureHeader(key, value);
+        }
+      } catch (e) {}
+    },
+
+    emit(json) {
+      for (const listener of this.listeners) {
+        try { listener(json); } catch (e) {}
+      }
+    },
+
+    parseResponse(text) {
+      if (!text || (text[0] !== '{' && text[0] !== '[')) return;
+      try { this.emit(JSON.parse(text)); } catch (e) {}
+    },
+
+    hookNetwork() {
+      if (this.hooked) return;
+      this.hooked = true;
+      const isApiUrl = url => typeof url === 'string' && url.includes('/i/api/');
+
+      if (typeof w.fetch === 'function') {
+        const origFetch = w.fetch;
+        this.originalFetch = origFetch;
+        w.fetch = function (...args) {
+          const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
+          if (isApiUrl(url)) {
+            ApiHub.captureHeaders(args[0]?.headers);
+            ApiHub.captureHeaders(args[1]?.headers);
+          }
+          const p = origFetch.apply(this, args);
+          try {
+            if (isApiUrl(url)) {
+              p.then(res => {
+                res.clone().text().then(text => ApiHub.parseResponse(text)).catch(() => {});
+              }).catch(() => {});
+            }
+          } catch (e) {}
+          return p;
+        };
+      }
+
+      const xhrProto = w.XMLHttpRequest?.prototype;
+      if (!xhrProto) return;
+      const origOpen = xhrProto.open;
+      const origSend = xhrProto.send;
+      const origSetRequestHeader = xhrProto.setRequestHeader;
+      xhrProto.open = function (method, url, ...rest) {
+        this.__xtApiUrl = String(url || '');
+        return origOpen.call(this, method, url, ...rest);
+      };
+      xhrProto.setRequestHeader = function (name, value, ...rest) {
+        if (isApiUrl(this.__xtApiUrl)) ApiHub.captureHeader(name, value);
+        return origSetRequestHeader.call(this, name, value, ...rest);
+      };
+      xhrProto.send = function (...args) {
+        try {
+          if (isApiUrl(this.__xtApiUrl)) {
+            this.addEventListener('load', function () {
+              try { ApiHub.parseResponse(this.responseText); } catch (e) {}
+            });
+          }
+        } catch (e) {}
+        return origSend.apply(this, args);
+      };
+    },
+
+    // 自有请求走原始 fetch，避免被 Hook 再次解析或触发额外逻辑。
+    fetch(...args) {
+      const fn = this.originalFetch || w.fetch;
+      return fn.apply(w, args);
+    },
+  };
+
+  /* ============================================================
+   * 4. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，防封号）
    * 原则：只在前端隐藏 HTML，不拦截网络请求、不模拟点击举报/拉黑，
    *       X 服务端完全感知不到，不触发风控。
    * 识别：X 给广告推文打了 [data-testid="placementTracking"] 追踪标记，
@@ -427,7 +540,7 @@
   };
 
   /* ============================================================
-   * 4. VideoDL —— 推文视频下载（原有逻辑，保留）
+   * 5. VideoDL —— 推文视频下载（原有逻辑，保留）
    * ============================================================ */
 
   const VideoDL = {
@@ -482,63 +595,36 @@
     },
 
     hookNetwork() {
-      const API_PATTERN = /\/i\/api\/graphql\//;
-      const extractFromJson = (json) => {
-        try {
-          (function walk(node) {
-            if (!node || typeof node !== 'object') return;
-            const media = node.extended_entities?.media || node.entities?.media;
-            if (Array.isArray(media)) {
-              for (const m of media) {
-                const variants = m.video_info?.variants;
-                if (!Array.isArray(variants)) continue;
-                const mp4s = variants
-                  .filter(v => v.content_type === 'video/mp4' && v.url)
-                  .map(v => ({ url: v.url, bitrate: v.bitrate || 0 }))
-                  .sort((a, b) => b.bitrate - a.bitrate);
-                if (!mp4s.length) continue;
-                const id = node.rest_id || node.legacy?.id_str;
-                if (id && /^\d+$/.test(String(id))) {
-                  VideoDL.videoCache.set(String(id), mp4s);
-                  console.debug(PREFIX, '已捕获视频:', id);
-                }
+      ApiHub.addListener(json => this.extractFromJson(json));
+    },
+
+    extractFromJson(json) {
+      try {
+        (function walk(node) {
+          if (!node || typeof node !== 'object') return;
+          const media = node.extended_entities?.media || node.entities?.media;
+          if (Array.isArray(media)) {
+            for (const m of media) {
+              const variants = m.video_info?.variants;
+              if (!Array.isArray(variants)) continue;
+              const mp4s = variants
+                .filter(v => v.content_type === 'video/mp4' && v.url)
+                .map(v => ({ url: v.url, bitrate: v.bitrate || 0 }))
+                .sort((a, b) => b.bitrate - a.bitrate);
+              if (!mp4s.length) continue;
+              const id = node.rest_id || node.legacy?.id_str;
+              if (id && /^\d+$/.test(String(id))) {
+                VideoDL.videoCache.set(String(id), mp4s);
+                console.debug(PREFIX, '已捕获视频:', id);
               }
             }
-            for (const k of Object.keys(node)) {
-              const c = node[k];
-              if (c && typeof c === 'object') walk(c);
-            }
-          })(json);
-        } catch (e) {}
-      };
-
-      const origFetch = w.fetch;
-      w.fetch = function (...args) {
-        const p = origFetch.apply(this, args);
-        try {
-          const url = typeof args[0] === 'string' ? args[0] : (args[0]?.url || '');
-          if (API_PATTERN.test(url)) {
-            p.then(res => res.clone().text().then(t => { try { extractFromJson(JSON.parse(t)); } catch (e) {} }).catch(() => {})).catch(() => {});
           }
-        } catch (e) {}
-        return p;
-      };
-      const origOpen = w.XMLHttpRequest.prototype.open;
-      const origSend = w.XMLHttpRequest.prototype.send;
-      w.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-        this.__xtUrl = url;
-        return origOpen.call(this, method, url, ...rest);
-      };
-      w.XMLHttpRequest.prototype.send = function (...args) {
-        try {
-          if (API_PATTERN.test(this.__xtUrl || '')) {
-            this.addEventListener('load', function () {
-              try { extractFromJson(JSON.parse(this.responseText)); } catch (e) {}
-            });
+          for (const k of Object.keys(node)) {
+            const c = node[k];
+            if (c && typeof c === 'object') walk(c);
           }
-        } catch (e) {}
-        return origSend.apply(this, args);
-      };
+        })(json);
+      } catch (e) {}
     },
 
     injectButtonStyle() {
@@ -743,6 +829,490 @@
   };
 
   /* ============================================================
+   * 6. Follow —— 时间线关注状态 + 手动一键关注
+   * 状态优先来自页面自身的 GraphQL/REST 响应；未知时才批量只读查询。
+   * 唯一写操作由用户点击触发，不做自动关注、批量关注或取关。
+   * ============================================================ */
+
+  const Follow = {
+    CACHE_KEY: 'xt_follow_cache_v1',
+    CACHE_TTL: 12 * 3600 * 1000,
+    MAX_CACHE: 1000,
+    LOOKUP_BATCH: 60,
+    LOOKUP_INTERVAL: 2500,
+    PENDING_LOOKUP_MAX: 200,
+
+    enabled: false,
+    cacheLoaded: false,
+    observer: null,
+    scanTimer: null,
+    rescanTimer: null,
+    lookupTimer: null,
+    saveTimer: null,
+    cooldownTimer: null,
+    followState: new Map(),
+    userIds: new Map(),
+    pendingLookup: new Set(),
+    locallyFollowed: new Set(),
+    selfName: null,
+    lookupPausedUntil: 0,
+    followInFlight: false,
+    followDisabledUntil: 0,
+
+    hookNetwork() {
+      this.enabled = Settings.get('quickFollow');
+      this.loadCache();
+      ApiHub.addListener(json => {
+        if (this.enabled) this.extractFromJson(json);
+      });
+    },
+
+    init() {
+      this.injectStyle();
+      registerFeature({
+        key: 'quickFollow',
+        label: '快捷关注',
+        desc: '作者名旁显示关注状态，可手动一键关注',
+        get: () => Settings.get('quickFollow'),
+        set: (v) => Settings.set('quickFollow', v),
+        onToggle: (v) => this.setEnabled(v),
+      });
+      this.installClickHandler();
+      this.setEnabled(Settings.get('quickFollow'));
+    },
+
+    normalize(name) {
+      return typeof name === 'string' ? name.trim().replace(/^@/, '').toLowerCase() : '';
+    },
+
+    loadCache() {
+      if (this.cacheLoaded) return;
+      this.cacheLoaded = true;
+      try {
+        const cache = GM_getValue(this.CACHE_KEY, {});
+        const now = Date.now();
+        const entries = Object.entries(cache || {})
+          .filter(([, v]) => v && typeof v.f === 'boolean' && now - v.t < this.CACHE_TTL)
+          .slice(-this.MAX_CACHE);
+        for (const [name, value] of entries) {
+          const key = this.normalize(name);
+          if (!key || this.followState.has(key)) continue;
+          this.followState.set(key, value.f);
+          if (value.id) this.userIds.set(key, String(value.id));
+        }
+      } catch (e) {}
+    },
+
+    saveCache() {
+      if (!this.cacheLoaded) return;
+      clearTimeout(this.saveTimer);
+      this.saveTimer = setTimeout(() => {
+        try {
+          const cache = {};
+          const entries = [...this.followState.entries()].slice(-this.MAX_CACHE);
+          for (const [name, following] of entries) {
+            cache[name] = { f: following, t: Date.now() };
+            const id = this.userIds.get(name);
+            if (id) cache[name].id = id;
+          }
+          GM_setValue(this.CACHE_KEY, cache);
+        } catch (e) {}
+      }, 800);
+    },
+
+    setState(name, following, restId = '', refresh = true) {
+      const key = this.normalize(name);
+      if (!key || typeof following !== 'boolean') return false;
+      this.pendingLookup.delete(key);
+      // 点击成功后，忽略仍在途的旧时间线响应，避免按钮闪回“关注”。
+      if (!following && this.locallyFollowed.has(key)) return false;
+      if (restId) this.userIds.set(key, String(restId));
+      if (this.followState.get(key) === following) return false;
+      this.followState.set(key, following);
+      this.saveCache();
+      if (refresh) this.refreshBadges(key);
+      return true;
+    },
+
+    readUser(node) {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+      const legacy = node.legacy && typeof node.legacy === 'object' ? node.legacy : null;
+      const relationship = node.relationship_perspectives;
+      const name = this.normalize(node.core?.screen_name || legacy?.screen_name || node.screen_name);
+      const following = relationship?.following ?? legacy?.following ?? node.following ?? node.is_following;
+      if (!name || typeof following !== 'boolean') return null;
+      return {
+        name,
+        following,
+        id: node.rest_id || legacy?.id_str || '',
+      };
+    },
+
+    extractFromJson(json) {
+      if (!json || typeof json !== 'object') return;
+      const pending = [json];
+      const visited = new WeakSet();
+      let visits = 0;
+      let changed = false;
+      while (pending.length && visits++ < 50000) {
+        const node = pending.pop();
+        if (!node || typeof node !== 'object' || visited.has(node)) continue;
+        visited.add(node);
+        const user = this.readUser(node);
+        if (user && this.setState(user.name, user.following, user.id, false)) changed = true;
+        for (const child of Object.values(node)) {
+          if (child && typeof child === 'object') pending.push(child);
+        }
+      }
+      if (changed) this.refreshBadges();
+    },
+
+    getCookie(name) {
+      const match = document.cookie.match(new RegExp('(?:^|;\\s*)' + name + '=([^;]+)'));
+      if (!match) return null;
+      try { return decodeURIComponent(match[1]); } catch (e) { return match[1]; }
+    },
+
+    authHeaders() {
+      const csrf = ApiHub.csrfToken || this.getCookie('ct0');
+      if (!ApiHub.authorization || !csrf) return null;
+      return {
+        authorization: ApiHub.authorization,
+        'x-csrf-token': csrf,
+        'x-twitter-active-user': 'yes',
+        'x-twitter-auth-type': 'OAuth2Session',
+        'x-twitter-client-language': 'zh-cn',
+      };
+    },
+
+    queueLookup(name) {
+      const key = this.normalize(name);
+      if (!key || this.followState.has(key) || this.pendingLookup.has(key)) return;
+      if (this.selfName && key === this.selfName) return;
+      if (this.pendingLookup.size >= this.PENDING_LOOKUP_MAX) {
+        const oldest = this.pendingLookup.values().next().value;
+        if (oldest !== undefined) this.pendingLookup.delete(oldest);
+      }
+      this.pendingLookup.add(key);
+      this.scheduleLookup();
+    },
+
+    scheduleLookup() {
+      if (!this.enabled || this.lookupTimer) return;
+      const wait = Math.max(
+        this.LOOKUP_INTERVAL + Math.floor(Math.random() * 1500),
+        this.lookupPausedUntil - Date.now()
+      );
+      this.lookupTimer = setTimeout(() => this.runLookup(), wait);
+    },
+
+    async runLookup() {
+      this.lookupTimer = null;
+      if (!this.enabled || !this.pendingLookup.size) return;
+      if (Date.now() < this.lookupPausedUntil) { this.scheduleLookup(); return; }
+      const headers = this.authHeaders();
+      if (!headers) {
+        // 等页面自己的首个 API 请求带来认证头，期间不发送任何请求。
+        this.lookupTimer = setTimeout(() => this.runLookup(), 5000);
+        return;
+      }
+      const batch = [...this.pendingLookup].slice(0, this.LOOKUP_BATCH);
+      try {
+        const res = await ApiHub.fetch(
+          location.origin + '/i/api/1.1/friendships/lookup.json?screen_name=' + encodeURIComponent(batch.join(',')),
+          { headers, credentials: 'include' }
+        );
+        if (res.ok) {
+          const users = await res.json();
+          const returned = new Set();
+          let changed = false;
+          for (const user of Array.isArray(users) ? users : []) {
+            const name = this.normalize(user.screen_name);
+            if (!name) continue;
+            returned.add(name);
+            const following = Array.isArray(user.connections) && user.connections.includes('following');
+            if (this.setState(name, following, user.id_str, false)) changed = true;
+          }
+          // 已删除、受限等未返回的账号不再反复查询。
+          for (const name of batch) {
+            if (!returned.has(name)) this.pendingLookup.delete(name);
+          }
+          if (changed) this.refreshBadges();
+        } else if (res.status === 429) {
+          const resetAt = Number(res.headers.get('x-rate-limit-reset')) * 1000;
+          this.lookupPausedUntil = resetAt > Date.now() ? resetAt : Date.now() + 60000;
+        }
+      } catch (e) {}
+      if (this.pendingLookup.size) this.scheduleLookup();
+    },
+
+    injectStyle() {
+      if (document.getElementById('xt-follow-style')) return;
+      const style = document.createElement('style');
+      style.id = 'xt-follow-style';
+      style.textContent = `
+        .xt-follow-badge{display:inline-flex;align-items:center;margin-left:8px;flex-shrink:0;font-family:inherit}
+        .xt-follow-btn{cursor:pointer;border:none;border-radius:9999px;padding:3px 12px;font-size:12px;font-weight:700;line-height:16px;transition:background-color .15s,opacity .15s;white-space:nowrap}
+        .xt-follow-btn:disabled{cursor:default;opacity:.6}
+        .xt-follow-btn.xt-dark{background:#eff3f4;color:#0f1419}
+        .xt-follow-btn.xt-dark:hover{background:#d7dbdc}
+        .xt-follow-btn.xt-light{background:#0f1419;color:#fff}
+        .xt-follow-btn.xt-light:hover{background:#272c30}
+        .xt-followed{font-size:12px;font-weight:500;padding:3px 10px;border-radius:9999px;border:1px solid;user-select:none;white-space:nowrap}
+        .xt-followed.xt-dark{color:#71767b;border-color:#333639}
+        .xt-followed.xt-light{color:#536471;border-color:#cfd9de}
+      `;
+      (document.head || document.documentElement).appendChild(style);
+    },
+
+    isDarkMode() {
+      try {
+        const channels = getComputedStyle(document.body).backgroundColor.match(/[\d.]+/g);
+        if (!channels || channels.length < 3) return true;
+        const luminance = 0.299 * +channels[0] + 0.587 * +channels[1] + 0.114 * +channels[2];
+        return luminance < 128;
+      } catch (e) { return true; }
+    },
+
+    refreshBadges(key) {
+      const selector = key ? '[data-xt-follow="' + key + '"]' : '[data-xt-follow]';
+      document.querySelectorAll(selector).forEach(badge => this.renderBadge(badge));
+    },
+
+    renderBadge(badge) {
+      const name = this.normalize(badge.getAttribute('data-xt-follow'));
+      badge.textContent = '';
+      if (!name || (this.selfName && name === this.selfName)) return;
+      let state = this.followState.get(name);
+      if (state === undefined) {
+        const article = badge.closest('article[data-testid="tweet"]');
+        const reactState = article && this.inspectReactRelationship(article, name);
+        if (typeof reactState === 'boolean') {
+          // 当前徽标继续本次渲染，其余同作者徽标在下一轮同步，避免递归重绘。
+          this.setState(name, reactState, '', false);
+          state = reactState;
+          setTimeout(() => this.refreshBadges(name), 0);
+        } else {
+          this.queueLookup(name);
+          return;
+        }
+      }
+      const theme = this.isDarkMode() ? 'xt-dark' : 'xt-light';
+      if (state) {
+        const span = document.createElement('span');
+        span.className = 'xt-followed ' + theme;
+        span.textContent = '已关注';
+        badge.appendChild(span);
+        return;
+      }
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'xt-follow-btn ' + theme;
+      btn.setAttribute('data-xt-follow-user', name);
+      btn.setAttribute('aria-label', '关注 @' + name);
+      const coolingDown = Date.now() < this.followDisabledUntil;
+      btn.disabled = this.followInFlight || coolingDown;
+      btn.textContent = coolingDown ? '限流中' : '关注';
+      badge.appendChild(btn);
+    },
+
+    // React 数据仅作无额外请求的兜底；遍历设上限，失败则走只读查询。
+    inspectReactRelationship(article, target) {
+      try {
+        const seeds = [];
+        const userName = article.querySelector('[data-testid="User-Name"]');
+        for (const element of [article, userName].filter(Boolean)) {
+          for (const key of Object.keys(element)) {
+            if (key.startsWith('__reactProps$') || key.startsWith('__reactFiber$')) seeds.push(element[key]);
+          }
+        }
+        const pending = seeds;
+        const visited = new WeakSet();
+        let visits = 0;
+        while (pending.length && visits++ < 5000) {
+          const value = pending.pop();
+          if (!value || typeof value !== 'object' || visited.has(value)) continue;
+          visited.add(value);
+          const user = this.readUser(value);
+          if (user?.name === target) return user.following;
+          for (const [key, child] of Object.entries(value)) {
+            if (!child || typeof child !== 'object') continue;
+            if (key === 'memoizedProps' || key === 'pendingProps' || key === 'return' ||
+                key === 'child' || key === 'sibling' || key === 'stateNode' || !key.startsWith('_')) {
+              pending.push(child);
+            }
+          }
+        }
+      } catch (e) {}
+      return undefined;
+    },
+
+    ownQuery(article, selector) {
+      for (const el of article.querySelectorAll(selector)) {
+        if (el.closest('article[data-testid="tweet"]') === article) return el;
+      }
+      return null;
+    },
+
+    extractAuthor(article) {
+      const userName = this.ownQuery(article, '[data-testid="User-Name"]');
+      if (!userName) return null;
+      for (const link of userName.querySelectorAll('a[href]')) {
+        try {
+          const url = new URL(link.getAttribute('href'), location.origin);
+          const match = url.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
+          if (match) return { name: this.normalize(match[1]), userName };
+        } catch (e) {}
+      }
+      return null;
+    },
+
+    detectSelf() {
+      let name = '';
+      const profile = document.querySelector('a[data-testid="AppTabBar_Profile_Link"][href]');
+      if (profile) {
+        const match = (profile.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
+        if (match) name = this.normalize(match[1]);
+      }
+      if (!name) {
+        const switcher = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
+        const match = (switcher?.textContent || '').match(/@([A-Za-z0-9_]{1,15})/);
+        if (match) name = this.normalize(match[1]);
+      }
+      if (name && name !== this.selfName) {
+        this.selfName = name;
+        this.refreshBadges();
+      }
+    },
+
+    processArticle(article) {
+      const author = this.extractAuthor(article);
+      let badge = this.ownQuery(article, '[data-xt-follow]');
+      if (!author) { badge?.remove(); return; }
+      if (this.selfName && author.name === this.selfName) { badge?.remove(); return; }
+      if (badge && badge.getAttribute('data-xt-follow') !== author.name) {
+        badge.remove();
+        badge = null;
+      }
+      if (badge) return;
+      const row = author.userName.firstElementChild;
+      if (!row) return;
+      badge = document.createElement('span');
+      badge.className = 'xt-follow-badge';
+      badge.setAttribute('data-xt-follow', author.name);
+      row.appendChild(badge);
+      this.renderBadge(badge);
+    },
+
+    scan() {
+      if (!this.enabled) return;
+      this.detectSelf();
+      document.querySelectorAll('article[data-testid="tweet"]').forEach(article => this.processArticle(article));
+    },
+
+    scheduleScan() {
+      if (this.scanTimer) return;
+      this.scanTimer = setTimeout(() => {
+        this.scanTimer = null;
+        this.scan();
+      }, 120);
+    },
+
+    setEnabled(on) {
+      this.enabled = on;
+      if (!on) {
+        this.observer?.disconnect();
+        this.observer = null;
+        clearTimeout(this.scanTimer);
+        clearTimeout(this.lookupTimer);
+        clearInterval(this.rescanTimer);
+        this.scanTimer = null;
+        this.lookupTimer = null;
+        this.rescanTimer = null;
+        this.pendingLookup.clear();
+        document.querySelectorAll('[data-xt-follow]').forEach(badge => badge.remove());
+        return;
+      }
+      this.detectSelf();
+      this.scan();
+      if (!this.observer) {
+        this.observer = new MutationObserver(() => this.scheduleScan());
+        this.observer.observe(document.body, { childList: true, subtree: true });
+      }
+      if (!this.rescanTimer) this.rescanTimer = setInterval(() => this.scan(), 2500);
+    },
+
+    installClickHandler() {
+      const shield = (e) => {
+        if (e.target?.closest?.('.xt-follow-badge')) e.stopPropagation();
+      };
+      document.addEventListener('mousedown', shield, true);
+      document.addEventListener('click', async (e) => {
+        const btn = e.target?.closest?.('[data-xt-follow-user]');
+        if (!btn) { shield(e); return; }
+        e.preventDefault();
+        e.stopPropagation();
+        if (this.followInFlight || Date.now() < this.followDisabledUntil) return;
+        const name = this.normalize(btn.getAttribute('data-xt-follow-user'));
+        if (!name) return;
+        this.followInFlight = true;
+        this.setButtonsDisabled(true);
+        btn.textContent = '…';
+        const result = await this.followUser(name);
+        this.followInFlight = false;
+        if (result.ok) {
+          this.locallyFollowed.add(name);
+          this.setState(name, true);
+        } else if (result.status === 429) {
+          const wait = result.resetAt > Date.now() ? result.resetAt - Date.now() : 15 * 60000;
+          this.startCooldown(wait);
+        } else {
+          btn.disabled = false;
+          btn.textContent = '重试';
+          this.setButtonsDisabled(false);
+        }
+      }, true);
+    },
+
+    setButtonsDisabled(disabled) {
+      const coolingDown = Date.now() < this.followDisabledUntil;
+      document.querySelectorAll('[data-xt-follow-user]').forEach(btn => {
+        btn.disabled = disabled || coolingDown;
+      });
+    },
+
+    startCooldown(wait) {
+      this.followDisabledUntil = Date.now() + wait;
+      clearTimeout(this.cooldownTimer);
+      this.cooldownTimer = setTimeout(() => {
+        this.followDisabledUntil = 0;
+        this.refreshBadges();
+      }, wait);
+      this.refreshBadges();
+    },
+
+    async followUser(name) {
+      const headers = this.authHeaders();
+      if (!headers) return { ok: false, status: 0, resetAt: 0 };
+      try {
+        const params = new URLSearchParams({ screen_name: name });
+        const userId = this.userIds.get(name);
+        if (userId) params.set('user_id', userId);
+        const res = await ApiHub.fetch(location.origin + '/i/api/1.1/friendships/create.json', {
+          method: 'POST',
+          headers: Object.assign(headers, { 'content-type': 'application/x-www-form-urlencoded' }),
+          body: params.toString(),
+          credentials: 'include',
+        });
+        const resetAt = Number(res.headers.get('x-rate-limit-reset')) * 1000;
+        return { ok: res.ok, status: res.status, resetAt: resetAt || 0 };
+      } catch (e) {
+        return { ok: false, status: 0, resetAt: 0 };
+      }
+    },
+  };
+
+  /* ============================================================
    * 启动
    * ============================================================ */
 
@@ -750,15 +1320,18 @@
     // 各模块初始化（注册功能开关）
     AdBlocker.init();
     VideoDL.init();
+    Follow.init();
     // 面板最后初始化（需要 features 已注册）
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.4.3');
+    console.log(PREFIX, '已启动 v1.5.0');
   }
 
-  // document-start 期 hook 网络要尽早，但 DOM 操作需等 body
+  // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
   VideoDL.hookNetwork();
+  Follow.hookNetwork();
+  ApiHub.hookNetwork();
   if (document.body) boot();
   else {
     const obs = new MutationObserver(() => {

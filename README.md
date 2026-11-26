@@ -4,7 +4,7 @@
 
 | 平台 | 脚本名称 | 功能简介 | 安装 |
 |------|----------|----------|------|
-| 推特 | [x-tools](x-tools.user.js) | 推文视频一键下载（最高画质 MP4），功能持续增加 | [安装](https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js) |
+| 推特 | [x-tools](x-tools.user.js) | 推文视频下载、广告屏蔽、时间线关注状态与一键关注 | [安装](https://raw.githubusercontent.com/xifandev/Tampermonkey/main/x-tools.user.js) |
 
 ---
 
