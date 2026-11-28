@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.6.2
+// @version      1.6.3
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -466,8 +466,8 @@
    * 4. AdBlocker —— 广告屏蔽（纯 DOM 隐藏，防封号）
    * 原则：只在前端隐藏 HTML，不拦截网络请求、不模拟点击举报/拉黑，
    *       X 服务端完全感知不到，不触发风控。
-   * 识别：X 给广告推文打了 [data-testid="placementTracking"] 追踪标记，
-   *       命中即隐藏整条推文。
+   * 识别：X 的 placementTracking 标记，或媒体下方“来自…的广告”来源文案。
+   *       命中后只隐藏对应推文。
    * ============================================================ */
 
   const AdBlocker = {
@@ -500,6 +500,10 @@
       this.observer = new MutationObserver((muts) => {
         if (!this.enabled) return;
         for (const m of muts) {
+          // X 有时只更新已有推文里的文案，需重新检查对应推文。
+          const ownerTweet = m.target.nodeType === 1 ?
+            m.target.closest('article[data-testid="tweet"]') : m.target.parentElement?.closest('article[data-testid="tweet"]');
+          if (ownerTweet) this.scan(ownerTweet);
           for (const n of m.addedNodes) {
             if (n.nodeType === 1) this.scan(n);
           }
@@ -525,15 +529,28 @@
         // placementTracking 是 X 专给广告位打的追踪容器，稳定可靠
         const tracks = root.querySelectorAll ?
           root.querySelectorAll('[data-testid="placementTracking"]') : [];
+        const tweets = new Set(root.matches?.('article[data-testid="tweet"]') ? [root] : []);
+        root.querySelectorAll?.('article[data-testid="tweet"]').forEach(tweet => tweets.add(tweet));
+        // 新式广告没有右上角标记，媒体下方会显示“来自 <域名> 的广告”。
+        const sourceAdLabel = /^来自\s*.+\s*的广告$/;
+        for (const tweet of tweets) {
+          if (Array.from(tweet.querySelectorAll('span')).some(span => sourceAdLabel.test(span.textContent.trim()))) {
+            this.hideTweet(tweet);
+          }
+        }
         for (const t of tracks) {
           // 只隐藏明确的广告推文；文章页可能复用追踪标记，不能隐藏任意 article 或整片容器
           const tweet = t.closest('article[data-testid="tweet"]');
-          if (tweet && tweet.style.display !== 'none') {
-            tweet.style.display = 'none';
-            console.debug(PREFIX, '已隐藏推广推文');
-          }
+          if (tweet) this.hideTweet(tweet);
         }
       } catch (e) { /* 忽略 */ }
+    },
+
+    hideTweet(tweet) {
+      if (tweet.style.display !== 'none') {
+        tweet.style.display = 'none';
+        console.debug(PREFIX, '已隐藏推广推文');
+      }
     },
   };
 
