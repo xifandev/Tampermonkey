@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.6.3
+// @version      1.6.4
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -340,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.6.2</span>' +
+        '<span>v1.6.4</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -1120,11 +1120,7 @@
         body.xt-silent-mode [role="menu"],
         body.xt-silent-mode [data-testid="Dropdown"],
         body.xt-silent-mode [data-testid="confirmationSheetDialog"],
-        body.xt-silent-mode [data-testid="sheetDialog"],
-        body.xt-silent-mode [role="dialog"],
-        body.xt-silent-mode [role="alertdialog"],
-        body.xt-silent-mode [data-slot="xds-modal-surface"],
-        body.xt-silent-mode [data-slot="xds-modal-backdrop"]{opacity:0!important;transition:none!important}
+        body.xt-silent-mode [data-testid="sheetDialog"]{opacity:0!important;transition:none!important}
       `;
       (document.head || document.documentElement).appendChild(style);
     },
@@ -1693,7 +1689,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.6.2', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
+    console.log(PREFIX, '已启动 v1.6.4', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
   }
 
   // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
