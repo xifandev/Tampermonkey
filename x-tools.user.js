@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.5.1
+// @version      1.6.0
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -340,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.5.1</span>' +
+        '<span>v1.6.0</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -835,7 +835,7 @@
    * ============================================================ */
 
   const Follow = {
-    CACHE_KEY: 'xt_follow_cache_v1',
+    CACHE_KEY: 'xt_follow_cache_v2',  // v1 缓存含 legacy.following 误判的 false，弃用
     CACHE_TTL: 12 * 3600 * 1000,
     MAX_CACHE: 1000,
     LOOKUP_BATCH: 60,
@@ -846,6 +846,12 @@
       'search', 'compose', 'intent', 'account', 'welcome', 'status',
       'hashtag', 'lists', 'communities', 'jobs', 'download', 'tos', 'privacy',
     ]),
+    // X Web 客户端公开 Bearer（页面前端写死，非用户凭证），仅用于 REST 兜底。
+    PUBLIC_BEARER: 'Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA',
+    FOLLOW_WORDS: ['follow', '关注', 'seguir', 'suivre', 'フォロー'],
+    UNFOLLOW_WORDS: ['unfollow', '取消关注', '取消關注', 'フォロー解除', 'dejar de seguir', 'ne plus suivre', 'entfolgen'],
+    EXCLUDE_WORDS: ['mute', 'block', '静音', '屏蔽', 'list', '列表', 'not interested', '不感兴趣'],
+    MORE_LABELS: new Set(['more', '更多', '更多选项', '更多選項', 'その他', 'más', 'mehr', 'plus']),
 
     enabled: false,
     cacheLoaded: false,
@@ -855,10 +861,19 @@
     lookupTimer: null,
     saveTimer: null,
     cooldownTimer: null,
+    peekTimer: null,
+    confirmTimer: null,
     followState: new Map(),
     userIds: new Map(),
     pendingLookup: new Set(),
+    weakState: new Set(),          // legacy.following 等低可信来源，须经菜单复核
+    peekQueue: new Set(),
+    peekArticles: new Map(),
+    peekDone: new Set(),
+    peekBusy: false,
+    confirmUnfollow: new Map(),   // name -> 确认过期时间
     locallyFollowed: new Set(),
+    locallyUnfollowed: new Set(),
     selfName: null,
     lookupPausedUntil: 0,
     followInFlight: false,
@@ -877,7 +892,7 @@
       registerFeature({
         key: 'quickFollow',
         label: '快捷关注',
-        desc: '作者名旁显示关注状态，可手动一键关注',
+        desc: '作者名旁显示关注/取关，自动探测已关注状态',
         get: () => Settings.get('quickFollow'),
         set: (v) => Settings.set('quickFollow', v),
         onToggle: (v) => this.setEnabled(v),
@@ -916,6 +931,7 @@
           const cache = {};
           const entries = [...this.followState.entries()].slice(-this.MAX_CACHE);
           for (const [name, following] of entries) {
+            if (this.weakState.has(name)) continue;  // 低可信状态不落盘，避免错误缓存 12 小时
             cache[name] = { f: following, t: Date.now() };
             const id = this.userIds.get(name);
             if (id) cache[name].id = id;
@@ -925,14 +941,20 @@
       }, 800);
     },
 
-    setState(name, following, restId = '', refresh = true) {
+    setState(name, following, restId = '', refresh = true, weak = false) {
       const key = this.normalize(name);
       if (!key || typeof following !== 'boolean') return false;
-      this.pendingLookup.delete(key);
-      // 点击成功后，忽略仍在途的旧时间线响应，避免按钮闪回“关注”。
+      // 用户操作后的短路保护：忽略在途的旧响应，避免按钮闪回。
       if (!following && this.locallyFollowed.has(key)) return false;
+      if (following && this.locallyUnfollowed.has(key)) return false;
       if (restId) this.userIds.set(key, String(restId));
-      if (this.followState.get(key) === following) return false;
+      // 低可信来源不得覆盖已确认结果；确认来源可覆盖并清除低可信标记。
+      if (weak && this.followState.has(key) && !this.weakState.has(key)) return false;
+      if (weak) this.weakState.add(key);
+      else this.weakState.delete(key);
+      this.pendingLookup.delete(key);
+      this.peekQueue.delete(key);
+      if (this.followState.get(key) === following && !weak) return false;
       this.followState.set(key, following);
       this.saveCache();
       if (refresh) this.refreshBadges(key);
@@ -944,13 +966,21 @@
       const legacy = node.legacy && typeof node.legacy === 'object' ? node.legacy : null;
       const relationship = node.relationship_perspectives;
       const name = this.normalize(node.core?.screen_name || legacy?.screen_name || node.screen_name);
-      const following = relationship?.following ?? legacy?.following ?? node.following ?? node.is_following;
+      let following;
+      let weak = false;
+      if (relationship && typeof relationship.following === 'boolean') {
+        following = relationship.following;
+      } else if (typeof node.following === 'boolean') {
+        following = node.following;
+      } else if (typeof node.is_following === 'boolean') {
+        following = node.is_following;
+      } else if (legacy && typeof legacy.following === 'boolean') {
+        // 时间线响应不带 relationship_perspectives，legacy.following 常为 false 占位。
+        following = legacy.following;
+        weak = true;
+      }
       if (!name || typeof following !== 'boolean') return null;
-      return {
-        name,
-        following,
-        id: node.rest_id || legacy?.id_str || '',
-      };
+      return { name, following, id: node.rest_id || legacy?.id_str || '', weak };
     },
 
     extractFromJson(json) {
@@ -964,7 +994,7 @@
         if (!node || typeof node !== 'object' || visited.has(node)) continue;
         visited.add(node);
         const user = this.readUser(node);
-        if (user && this.setState(user.name, user.following, user.id, false)) changed = true;
+        if (user && this.setState(user.name, user.following, user.id, false, user.weak)) changed = true;
         for (const child of Object.values(node)) {
           if (child && typeof child === 'object') pending.push(child);
         }
@@ -980,9 +1010,11 @@
 
     authHeaders() {
       const csrf = ApiHub.csrfToken || this.getCookie('ct0');
-      if (!ApiHub.authorization || !csrf) return null;
+      if (!csrf) return null;
+      // 页面请求捕获不到 authorization 时回退到 X Web 公开客户端 token，
+      // 否则 REST 兜底永远发不出去（旧版"点了没反应"的根因之一）。
       return {
-        authorization: ApiHub.authorization,
+        authorization: ApiHub.authorization || this.PUBLIC_BEARER,
         'x-csrf-token': csrf,
         'x-twitter-active-user': 'yes',
         'x-twitter-auth-type': 'OAuth2Session',
@@ -992,7 +1024,9 @@
 
     queueLookup(name) {
       const key = this.normalize(name);
-      if (!key || this.followState.has(key) || this.pendingLookup.has(key)) return;
+      // 低可信状态仍要复核；已确认状态才跳过。
+      if (!key || this.pendingLookup.has(key)) return;
+      if (this.followState.has(key) && !this.weakState.has(key)) return;
       if (this.selfName && key === this.selfName) return;
       if (this.pendingLookup.size >= this.PENDING_LOOKUP_MAX) {
         const oldest = this.pendingLookup.values().next().value;
@@ -1063,9 +1097,19 @@
         .xt-follow-btn.xt-dark:hover{background:#d7dbdc}
         .xt-follow-btn.xt-light{background:#0f1419;color:#fff}
         .xt-follow-btn.xt-light:hover{background:#272c30}
-        .xt-followed{font-size:12px;font-weight:500;padding:3px 10px;border-radius:9999px;border:1px solid;user-select:none;white-space:nowrap}
-        .xt-followed.xt-dark{color:#71767b;border-color:#333639}
-        .xt-followed.xt-light{color:#536471;border-color:#cfd9de}
+        .xt-follow-btn.xt-unfollow{background:transparent;font-weight:500;border:1px solid}
+        .xt-follow-btn.xt-unfollow.xt-dark{color:#71767b;border-color:#333639}
+        .xt-follow-btn.xt-unfollow.xt-light{color:#536471;border-color:#cfd9de}
+        .xt-follow-btn.xt-unfollow:hover{color:#f4212e;border-color:rgba(244,33,46,.45);background:rgba(244,33,46,.06)}
+        .xt-follow-btn.xt-confirm{color:#f4212e;border-color:rgba(244,33,46,.55)}
+        body.xt-silent-mode [role="menu"],
+        body.xt-silent-mode [data-testid="Dropdown"],
+        body.xt-silent-mode [data-testid="confirmationSheetDialog"],
+        body.xt-silent-mode [data-testid="sheetDialog"],
+        body.xt-silent-mode [role="dialog"],
+        body.xt-silent-mode [role="alertdialog"],
+        body.xt-silent-mode [data-slot="xds-modal-surface"],
+        body.xt-silent-mode [data-slot="xds-modal-backdrop"]{opacity:0!important;transition:none!important}
       `;
       (document.head || document.documentElement).appendChild(style);
     },
@@ -1088,69 +1132,216 @@
       const name = this.normalize(badge.getAttribute('data-xt-follow'));
       badge.textContent = '';
       if (!name || (this.selfName && name === this.selfName)) return;
+      const article = badge.closest('article, [role="article"]');
       let state = this.followState.get(name);
-      if (state === undefined) {
-        const article = badge.closest('article, [role="article"]');
-        const reactState = article && this.inspectReactRelationship(article, name);
-        if (typeof reactState === 'boolean') {
-          // 当前徽标继续本次渲染，其余同作者徽标在下一轮同步，避免递归重绘。
-          this.setState(name, reactState, '', false);
-          state = reactState;
-          setTimeout(() => this.refreshBadges(name), 0);
-        } else {
-          // 状态未知也给出可用按钮：用户可手动确认，后台只读查询拿到结果后再同步。
-          this.queueLookup(name);
-        }
+      if (state === undefined || this.weakState.has(name)) {
+        // 时间线响应通常不带 relationship_perspectives，legacy.following 是 false 占位。
+        // 用原生「···」菜单文本做权威复核，只读查询作为补充。
+        this.queueLookup(name);
+        if (article) this.queuePeek(name, article);
       }
       const theme = this.isDarkMode() ? 'xt-dark' : 'xt-light';
-      if (state) {
-        const span = document.createElement('span');
-        span.className = 'xt-followed ' + theme;
-        span.textContent = '已关注';
-        badge.appendChild(span);
-        return;
-      }
+      const coolingDown = Date.now() < this.followDisabledUntil;
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'xt-follow-btn ' + theme;
       btn.setAttribute('data-xt-follow-user', name);
-      btn.setAttribute('aria-label', '关注 @' + name);
-      if (state === undefined) btn.title = '关注状态未知，点击尝试关注';
-      const coolingDown = Date.now() < this.followDisabledUntil;
+      if (state === true) {
+        // 已关注：低调暗色「取关」，点击需二次确认防误触。
+        const confirming = (this.confirmUnfollow.get(name) || 0) > Date.now();
+        btn.className = 'xt-follow-btn xt-unfollow ' + (confirming ? 'xt-confirm ' : '') + theme;
+        btn.setAttribute('data-xt-follow-action', 'unfollow');
+        btn.setAttribute('aria-label', '取关 @' + name);
+        btn.textContent = confirming ? '确认取关' : '取关';
+      } else {
+        btn.className = 'xt-follow-btn ' + theme;
+        btn.setAttribute('data-xt-follow-action', 'follow');
+        btn.setAttribute('aria-label', '关注 @' + name);
+        if (state === undefined) btn.title = '关注状态未知，点击尝试关注';
+        btn.textContent = coolingDown ? '限流中' : '关注';
+      }
       btn.disabled = this.followInFlight || coolingDown;
-      btn.textContent = coolingDown ? '限流中' : '关注';
       badge.appendChild(btn);
     },
 
-    // React 数据仅作无额外请求的兜底；遍历设上限，失败则走只读查询。
-    inspectReactRelationship(article, target) {
+    // ---- 原生「···」菜单：状态探测 + 动作执行（借鉴 X FollowFlow）----
+    // X 新版写操作需要事务签名，直接 POST v1.1 REST 常失效；
+    // 让 X 自己点菜单发请求最稳，REST 仅作兜底。
+    findCaretButton(article) {
+      if (!article || typeof article.querySelectorAll !== 'function') return null;
+      const legacy = this.ownQuery(article, 'button[data-testid="caret"]');
+      if (legacy) return legacy;
       try {
-        const seeds = [];
-        const userName = article.querySelector('[data-testid="User-Name"]');
-        for (const element of [article, userName].filter(Boolean)) {
-          for (const key of Object.keys(element)) {
-            if (key.startsWith('__reactProps$') || key.startsWith('__reactFiber$')) seeds.push(element[key]);
-          }
-        }
-        const pending = seeds;
-        const visited = new WeakSet();
-        let visits = 0;
-        while (pending.length && visits++ < 5000) {
-          const value = pending.pop();
-          if (!value || typeof value !== 'object' || visited.has(value)) continue;
-          visited.add(value);
-          const user = this.readUser(value);
-          if (user?.name === target) return user.following;
-          for (const [key, child] of Object.entries(value)) {
-            if (!child || typeof child !== 'object') continue;
-            if (key === 'memoizedProps' || key === 'pendingProps' || key === 'return' ||
-                key === 'child' || key === 'sibling' || key === 'stateNode' || !key.startsWith('_')) {
-              pending.push(child);
-            }
-          }
-        }
+        const icon = this.ownQuery(article, 'button:has(use[href*="icon-more-dots"])');
+        if (icon) return icon;
       } catch (e) {}
-      return undefined;
+      for (const btn of article.querySelectorAll('button[aria-label], button[aria-haspopup="menu"], button[data-slot="xds-menu-trigger"]')) {
+        // 只认本条帖子的按钮，排除嵌套引用推文，避免点错菜单。
+        if (btn.closest('article, [role="article"]') !== article) continue;
+        if (btn.closest('[data-engagement-action]')) continue;
+        const label = (btn.getAttribute('aria-label') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        if (this.MORE_LABELS.has(label)) return btn;
+        if (btn.getAttribute('aria-haspopup') === 'menu' || btn.getAttribute('data-slot') === 'xds-menu-trigger') return btn;
+      }
+      return null;
+    },
+
+    findOpenMenu() {
+      return document.querySelector('[role="menu"], [data-testid="Dropdown"]');
+    },
+
+    findConfirmButton() {
+      const legacy = document.querySelector('[data-testid="confirmationSheetConfirm"]');
+      if (legacy) return legacy;
+      for (const modal of document.querySelectorAll('[role="dialog"], [role="alertdialog"], [data-slot="xds-modal-surface"]')) {
+        const text = (modal.textContent || '').toLowerCase();
+        if (!this.UNFOLLOW_WORDS.some(word => text.includes(word))) continue;
+        for (const btn of modal.querySelectorAll('button, [role="button"]')) {
+          const label = (btn.textContent || '').trim().toLowerCase();
+          if (this.UNFOLLOW_WORDS.some(word => label.includes(word))) return btn;
+        }
+        const footer = modal.querySelectorAll('[data-slot="xds-modal-footer-actions"] button');
+        if (footer.length) return footer[footer.length - 1];
+      }
+      return null;
+    },
+
+    triggerClick(el) {
+      if (!el) return;
+      const opts = { bubbles: true, cancelable: true, view: w };
+      try {
+        if (typeof w.PointerEvent === 'function') {
+          el.dispatchEvent(new w.PointerEvent('pointerdown', opts));
+          el.dispatchEvent(new w.PointerEvent('pointerup', opts));
+        }
+        el.dispatchEvent(new w.MouseEvent('mousedown', opts));
+        el.dispatchEvent(new w.MouseEvent('mouseup', opts));
+      } catch (e) {}
+      el.click();
+    },
+
+    sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    },
+
+    closeMenu(caret) {
+      this.triggerClick(caret);
+      try {
+        document.dispatchEvent(new w.KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+      } catch (e) {}
+    },
+
+    // 静默打开菜单读文本："取消关注 @x" => 已关注；"关注 @x" => 未关注。
+    async peekCaretState(article, name) {
+      const caret = this.findCaretButton(article);
+      if (!caret) return null;
+      document.body.classList.add('xt-silent-mode');
+      try {
+        this.triggerClick(caret);
+        let menu = null;
+        for (let i = 0; i < 12; i++) {
+          menu = this.findOpenMenu();
+          if (menu) break;
+          await this.sleep(25);
+        }
+        if (!menu) return null;
+        const text = (menu.textContent || '').toLowerCase();
+        let result = null;
+        if (text.includes('@' + name)) {
+          if (this.UNFOLLOW_WORDS.some(word => text.includes(word))) result = true;
+          else if (this.FOLLOW_WORDS.some(word => text.includes(word))) result = false;
+        }
+        this.closeMenu(caret);
+        return result;
+      } catch (e) {
+        return null;
+      } finally {
+        document.body.classList.remove('xt-silent-mode');
+      }
+    },
+
+    queuePeek(name, article) {
+      const key = this.normalize(name);
+      if (!key || !article || this.peekDone.has(key) || this.peekQueue.has(key)) return;
+      if (this.selfName && key === this.selfName) return;
+      if (this.peekDone.size > 500) this.peekDone.clear();
+      this.peekQueue.add(key);
+      this.peekArticles.set(key, article);
+      this.schedulePeek();
+    },
+
+    schedulePeek() {
+      if (!this.enabled || this.peekBusy || this.peekTimer) return;
+      this.peekTimer = setTimeout(() => {
+        this.peekTimer = null;
+        this.runPeek();
+      }, 120);
+    },
+
+    async runPeek() {
+      if (this.peekBusy || !this.peekQueue.size) return;
+      this.peekBusy = true;
+      const key = this.peekQueue.values().next().value;
+      this.peekQueue.delete(key);
+      this.peekDone.add(key);  // 立即标记，避免并发重绘导致重复开菜单
+      const article = this.peekArticles.get(key);
+      this.peekArticles.delete(key);
+      try {
+        if (article?.isConnected) {
+          const state = await this.peekCaretState(article, key);
+          if (typeof state === 'boolean') this.setState(key, state, '', true);
+        }
+      } catch (e) {} finally {
+        this.peekBusy = false;
+        if (this.peekQueue.size) this.schedulePeek();
+      }
+    },
+
+    async executeViaCaret(article, name, wantFollow) {
+      const caret = this.findCaretButton(article);
+      if (!caret) return false;
+      document.body.classList.add('xt-silent-mode');
+      try {
+        this.triggerClick(caret);
+        let menu = null;
+        for (let i = 0; i < 20; i++) {
+          menu = this.findOpenMenu();
+          if (menu) break;
+          await this.sleep(40);
+        }
+        if (!menu) { this.closeMenu(caret); return false; }
+        const items = menu.querySelectorAll('[role="menuitem"], [role="menuitemradio"], button, a, div[tabindex="0"]');
+        let target = null;
+        for (const item of items) {
+          const text = (item.textContent || '').toLowerCase();
+          if (this.EXCLUDE_WORDS.some(word => text.includes(word))) continue;
+          const hasHandle = text.includes('@' + name);
+          if (wantFollow) {
+            const isFollow = this.FOLLOW_WORDS.some(word => text.includes(word)) &&
+              !this.UNFOLLOW_WORDS.some(word => text.includes(word));
+            if (isFollow && hasHandle) { target = item; break; }
+            // 弱兜底：菜单项不带 @handle 时，只接受短文本且不含其他 handle 的项。
+            if (isFollow && !target && text.length < 30 && !/@[a-z0-9_]{2,}/.test(text)) target = item;
+          } else if (hasHandle && this.UNFOLLOW_WORDS.some(word => text.includes(word))) {
+            target = item;
+            break;
+          }
+        }
+        if (!target) { this.closeMenu(caret); return false; }
+        this.triggerClick(target);
+        if (!wantFollow) {
+          for (let i = 0; i < 20; i++) {
+            const confirm = this.findConfirmButton();
+            if (confirm) { this.triggerClick(confirm); break; }
+            await this.sleep(40);
+          }
+        }
+        await this.sleep(120);
+        return true;
+      } catch (e) {
+        return false;
+      } finally {
+        document.body.classList.remove('xt-silent-mode');
+      }
     },
 
     ownQuery(article, selector) {
@@ -1327,13 +1518,22 @@
         clearTimeout(this.scanTimer);
         clearTimeout(this.lookupTimer);
         clearInterval(this.rescanTimer);
+        clearTimeout(this.peekTimer);
+        clearTimeout(this.confirmTimer);
         this.scanTimer = null;
         this.lookupTimer = null;
         this.rescanTimer = null;
+        this.peekTimer = null;
+        this.peekBusy = false;
+        this.peekQueue.clear();
+        this.peekArticles.clear();
+        this.confirmUnfollow.clear();
         this.pendingLookup.clear();
+        document.body.classList.remove('xt-silent-mode');
         document.querySelectorAll('[data-xt-follow]').forEach(badge => badge.remove());
         return;
       }
+      this.peekDone.clear();
       this.detectSelf();
       this.scan();
       if (!this.observer) {
@@ -1356,21 +1556,48 @@
         if (this.followInFlight || Date.now() < this.followDisabledUntil) return;
         const name = this.normalize(btn.getAttribute('data-xt-follow-user'));
         if (!name) return;
+        const wantFollow = btn.getAttribute('data-xt-follow-action') !== 'unfollow';
+        const article = btn.closest('article, [role="article"]');
+
+        // 取关两步确认：3 秒内再点才执行，防刷推误触。
+        if (!wantFollow && (this.confirmUnfollow.get(name) || 0) <= Date.now()) {
+          this.confirmUnfollow.set(name, Date.now() + 3000);
+          this.refreshBadges(name);
+          clearTimeout(this.confirmTimer);
+          this.confirmTimer = setTimeout(() => {
+            this.confirmUnfollow.delete(name);
+            this.refreshBadges(name);
+          }, 3100);
+          return;
+        }
+        this.confirmUnfollow.delete(name);
+
         this.followInFlight = true;
         this.setButtonsDisabled(true);
         btn.textContent = '…';
-        const result = await this.followUser(name);
-        this.followInFlight = false;
+        let result = { ok: false, status: 0, resetAt: 0 };
+        try {
+          result = await this.followUser(name, article, wantFollow);
+        } catch (err) {} finally {
+          this.followInFlight = false;
+        }
+        // 所有分支都要恢复其余按钮，否则后续点击全部"没反应"。
+        this.setButtonsDisabled(false);
         if (result.ok) {
-          this.locallyFollowed.add(name);
-          this.setState(name, true);
+          if (wantFollow) {
+            this.locallyFollowed.add(name);
+            this.locallyUnfollowed.delete(name);
+          } else {
+            this.locallyUnfollowed.add(name);
+            this.locallyFollowed.delete(name);
+          }
+          this.setState(name, wantFollow);
         } else if (result.status === 429) {
           const wait = result.resetAt > Date.now() ? result.resetAt - Date.now() : 15 * 60000;
           this.startCooldown(wait);
-        } else {
-          btn.disabled = false;
+        } else if (btn.isConnected) {
           btn.textContent = '重试';
-          this.setButtonsDisabled(false);
+          btn.title = '操作失败，点击重试';
         }
       }, true);
     },
@@ -1392,24 +1619,49 @@
       this.refreshBadges();
     },
 
-    async followUser(name) {
+    async followUser(name, article, wantFollow = true) {
+      // 首选：触发推文原生「···」菜单，由 X 自己发带签名的请求。
+      // 旧版直接 POST v1.1 REST 在 X 新版常失效，表现为"点了没反应"。
+      if (article) {
+        try {
+          if (await this.executeViaCaret(article, name, wantFollow)) {
+            return { ok: true, status: 200, resetAt: 0 };
+          }
+        } catch (e) {}
+      }
+      return this.followUserViaApi(name, wantFollow);
+    },
+
+    async followUserViaApi(name, wantFollow) {
       const headers = this.authHeaders();
       if (!headers) return { ok: false, status: 0, resetAt: 0 };
-      try {
-        const params = new URLSearchParams({ screen_name: name });
-        const userId = this.userIds.get(name);
-        if (userId) params.set('user_id', userId);
-        const res = await ApiHub.fetch(location.origin + '/i/api/1.1/friendships/create.json', {
-          method: 'POST',
-          headers: Object.assign(headers, { 'content-type': 'application/x-www-form-urlencoded' }),
-          body: params.toString(),
-          credentials: 'include',
-        });
-        const resetAt = Number(res.headers.get('x-rate-limit-reset')) * 1000;
-        return { ok: res.ok, status: res.status, resetAt: resetAt || 0 };
-      } catch (e) {
-        return { ok: false, status: 0, resetAt: 0 };
+      const path = wantFollow ? 'friendships/create.json' : 'friendships/destroy.json';
+      const params = new URLSearchParams({ screen_name: name });
+      const userId = this.userIds.get(name);
+      if (userId) params.set('user_id', userId);
+      const body = params.toString();
+      const endpoints = [
+        location.origin + '/i/api/1.1/' + path,
+        'https://api.x.com/1.1/' + path,
+      ];
+      let lastStatus = 0;
+      let resetAt = 0;
+      for (const url of endpoints) {
+        try {
+          const res = await ApiHub.fetch(url, {
+            method: 'POST',
+            headers: Object.assign({}, headers, { 'content-type': 'application/x-www-form-urlencoded' }),
+            body,
+            credentials: 'include',
+          });
+          lastStatus = res.status;
+          const ra = Number(res.headers.get('x-rate-limit-reset')) * 1000;
+          if (ra) resetAt = ra;
+          if (res.ok) return { ok: true, status: 200, resetAt };
+          if (res.status === 429) return { ok: false, status: 429, resetAt };
+        } catch (e) {}
       }
+      return { ok: false, status: lastStatus, resetAt };
     },
   };
 
@@ -1426,7 +1678,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.5.1', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
+    console.log(PREFIX, '已启动 v1.6.0', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
   }
 
   // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
