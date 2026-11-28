@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.6.0
+// @version      1.6.1
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -180,9 +180,9 @@
     const style = document.createElement('style');
     style.id = 'xt-style';
     style.textContent = `
-      /* 悬浮按钮：fixed 定位，尺寸/样式运行时复制官方 Grok 按钮，位置动态跟随 */
+      /* 悬浮按钮：不设置 z-index，避免盖住 Grok 聊天窗等 X 原生浮层 */
       .xt-fab {
-        position: fixed; z-index: 2147483646;
+        position: fixed;
         display: flex; align-items: center; justify-content: center;
         box-sizing: border-box; cursor: pointer; padding: 0; outline: none;
         transition: transform 0.15s, filter 0.15s;
@@ -192,7 +192,7 @@
       .xt-fab.xt-btn-active { filter: brightness(1.4); }
       /* 面板卡片 */
       .xt-card {
-        position: fixed; z-index: 2147483647;
+        position: fixed;
         width: 300px; display: none; flex-direction: column;
         background: rgba(21, 24, 28, 0.96);
         border: 1px solid rgba(255,255,255,0.1);
@@ -340,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.6.0</span>' +
+        '<span>v1.6.1</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -1678,7 +1678,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.6.0', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
+    console.log(PREFIX, '已启动 v1.6.1', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
   }
 
   // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
