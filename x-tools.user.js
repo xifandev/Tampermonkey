@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.5.0
+// @version      1.5.1
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -340,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.5.0</span>' +
+        '<span>v1.5.1</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -841,6 +841,11 @@
     LOOKUP_BATCH: 60,
     LOOKUP_INTERVAL: 2500,
     PENDING_LOOKUP_MAX: 200,
+    RESERVED_PATHS: new Set([
+      'home', 'explore', 'notifications', 'messages', 'i', 'settings',
+      'search', 'compose', 'intent', 'account', 'welcome', 'status',
+      'hashtag', 'lists', 'communities', 'jobs', 'download', 'tos', 'privacy',
+    ]),
 
     enabled: false,
     cacheLoaded: false,
@@ -1051,7 +1056,7 @@
       const style = document.createElement('style');
       style.id = 'xt-follow-style';
       style.textContent = `
-        .xt-follow-badge{display:inline-flex;align-items:center;margin-left:8px;flex-shrink:0;font-family:inherit}
+        .xt-follow-badge{display:inline-flex!important;align-items:center;align-self:center;vertical-align:middle;margin-left:8px;flex-shrink:0;font-family:inherit}
         .xt-follow-btn{cursor:pointer;border:none;border-radius:9999px;padding:3px 12px;font-size:12px;font-weight:700;line-height:16px;transition:background-color .15s,opacity .15s;white-space:nowrap}
         .xt-follow-btn:disabled{cursor:default;opacity:.6}
         .xt-follow-btn.xt-dark{background:#eff3f4;color:#0f1419}
@@ -1085,7 +1090,7 @@
       if (!name || (this.selfName && name === this.selfName)) return;
       let state = this.followState.get(name);
       if (state === undefined) {
-        const article = badge.closest('article[data-testid="tweet"]');
+        const article = badge.closest('article, [role="article"]');
         const reactState = article && this.inspectReactRelationship(article, name);
         if (typeof reactState === 'boolean') {
           // 当前徽标继续本次渲染，其余同作者徽标在下一轮同步，避免递归重绘。
@@ -1093,8 +1098,8 @@
           state = reactState;
           setTimeout(() => this.refreshBadges(name), 0);
         } else {
+          // 状态未知也给出可用按钮：用户可手动确认，后台只读查询拿到结果后再同步。
           this.queueLookup(name);
-          return;
         }
       }
       const theme = this.isDarkMode() ? 'xt-dark' : 'xt-light';
@@ -1110,6 +1115,7 @@
       btn.className = 'xt-follow-btn ' + theme;
       btn.setAttribute('data-xt-follow-user', name);
       btn.setAttribute('aria-label', '关注 @' + name);
+      if (state === undefined) btn.title = '关注状态未知，点击尝试关注';
       const coolingDown = Date.now() < this.followDisabledUntil;
       btn.disabled = this.followInFlight || coolingDown;
       btn.textContent = coolingDown ? '限流中' : '关注';
@@ -1149,35 +1155,120 @@
 
     ownQuery(article, selector) {
       for (const el of article.querySelectorAll(selector)) {
-        if (el.closest('article[data-testid="tweet"]') === article) return el;
+        if (el.closest('article, [role="article"]') === article) return el;
       }
       return null;
     },
 
-    extractAuthor(article) {
-      const userName = this.ownQuery(article, '[data-testid="User-Name"]');
-      if (!userName) return null;
-      for (const link of userName.querySelectorAll('a[href]')) {
-        try {
-          const url = new URL(link.getAttribute('href'), location.origin);
-          const match = url.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
-          if (match) return { name: this.normalize(match[1]), userName };
-        } catch (e) {}
+    userFromHref(href) {
+      try {
+        const url = new URL(href, location.origin);
+        const match = url.pathname.match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
+        if (!match) return '';
+        const name = this.normalize(match[1]);
+        return this.RESERVED_PATHS.has(name) ? '' : name;
+      } catch (e) { return ''; }
+    },
+
+    userFromAlt(alt) {
+      const match = String(alt || '').trim().match(/^@([A-Za-z0-9_]{1,15})$/);
+      return match ? this.normalize(match[1]) : '';
+    },
+
+    authorFromContainer(container) {
+      if (!container || typeof container.querySelectorAll !== 'function') return null;
+      for (const link of container.querySelectorAll('a[href]')) {
+        const name = this.userFromHref(link.getAttribute('href'));
+        if (name) return { name, container };
+      }
+      const match = (container.textContent || '').match(/@([A-Za-z0-9_]{1,15})/);
+      if (match && !this.RESERVED_PATHS.has(this.normalize(match[1]))) {
+        return { name: this.normalize(match[1]), container };
       }
       return null;
+    },
+
+    // 找 @handle 文本所在的最小元素（通常是名字行里的 span），用于定位徽标。
+    findHandleElement(root) {
+      try {
+        const SHOW_TEXT = w.NodeFilter?.SHOW_TEXT || 4;
+        const walker = document.createTreeWalker(root, SHOW_TEXT, null);
+        let node;
+        while ((node = walker.nextNode())) {
+          // 允许 "@handle · 时间" 同一节点，但排除正文里的 @提及。
+          const match = (node.nodeValue || '').trim().match(/^@([A-Za-z0-9_]{1,15})(?=\s*[·•]|\s*$)/);
+          if (!match) continue;
+          const parent = node.parentElement;
+          if (parent && parent !== root && !this.RESERVED_PATHS.has(this.normalize(match[1]))) return parent;
+        }
+      } catch (e) {}
+      return null;
+    },
+
+    extractAuthor(article) {
+      // 不依赖 X 内部 testid / class：改版移除 data-testid 后仍可工作。
+      // 作者 = 名字行（或整条帖子）里第一条指向 /{handle} 的链接。
+      const userName = this.ownQuery(article, '[data-testid="User-Name"]');
+      let link = null;
+      let name = '';
+      let scanned = 0;
+      for (const a of (userName || article).querySelectorAll('a[href]')) {
+        if (++scanned > 30) break;
+        const candidate = this.userFromHref(a.getAttribute('href'));
+        if (candidate) { link = a; name = candidate; break; }
+      }
+      if (!name && userName) name = this.authorFromContainer(userName)?.name || '';
+      if (!name) {
+        const avatar = this.ownQuery(article, 'img[alt^="@"]');
+        if (avatar) name = this.userFromAlt(avatar.getAttribute('alt'));
+      }
+      if (!name) {
+        const match = (userName?.textContent || article.textContent || '')
+          .match(/@([A-Za-z0-9_]{1,15})/);
+        if (match) name = this.normalize(match[1]);
+      }
+      if (!name || this.RESERVED_PATHS.has(name)) return null;
+
+      let row = null;
+      let before = null;
+      if (userName && userName.firstElementChild) {
+        // 旧版：徽标跟在显示名行末尾，保持原有视觉位置。
+        row = userName.firstElementChild;
+      } else {
+        const handleEl = this.findHandleElement(article);
+        if (handleEl) {
+          const anchor = handleEl.closest('a');
+          const ref = anchor || handleEl;
+          row = ref.parentElement;
+          before = ref.nextSibling;
+        } else if (link) {
+          // 再兜底：直接插到作者链接之后。
+          row = link.parentElement;
+          before = link.nextSibling;
+        }
+      }
+      if (!row) return null;
+      return { name, row, before };
     },
 
     detectSelf() {
       let name = '';
       const profile = document.querySelector('a[data-testid="AppTabBar_Profile_Link"][href]');
-      if (profile) {
-        const match = (profile.getAttribute('href') || '').match(/^\/([A-Za-z0-9_]{1,15})\/?$/);
-        if (match) name = this.normalize(match[1]);
-      }
+      if (profile) name = this.userFromHref(profile.getAttribute('href'));
       if (!name) {
         const switcher = document.querySelector('[data-testid="SideNav_AccountSwitcher_Button"]');
         const match = (switcher?.textContent || '').match(/@([A-Za-z0-9_]{1,15})/);
         if (match) name = this.normalize(match[1]);
+      }
+      if (!name) {
+        // 只认导航区里 aria-label 明确的“个人资料/Profile”，避免误把帖内链接当自己。
+        for (const anchor of document.querySelectorAll('nav a[href^="/"], [role="navigation"] a[href^="/"]')) {
+          const label = (anchor.getAttribute('aria-label') || '')
+            .replace(/\s+/g, ' ').trim().toLowerCase();
+          if (!(label === '个人资料' || /^profile(?:\s|,|@|$)/.test(label))) continue;
+          const candidate = this.userFromHref(anchor.getAttribute('href'));
+          if (candidate) { name = candidate; break; }
+        }
       }
       if (name && name !== this.selfName) {
         this.selfName = name;
@@ -1194,20 +1285,30 @@
         badge.remove();
         badge = null;
       }
-      if (badge) return;
-      const row = author.userName.firstElementChild;
-      if (!row) return;
+      if (badge) {
+        // React 重渲染可能清空外部插入的节点，内容丢了就重建，避免留下空白徽标。
+        if (!badge.firstChild) this.renderBadge(badge);
+        return;
+      }
       badge = document.createElement('span');
       badge.className = 'xt-follow-badge';
       badge.setAttribute('data-xt-follow', author.name);
-      row.appendChild(badge);
+      if (author.before && author.before.parentNode === author.row) {
+        author.row.insertBefore(badge, author.before);
+      } else {
+        author.row.appendChild(badge);
+      }
       this.renderBadge(badge);
     },
 
     scan() {
       if (!this.enabled) return;
       this.detectSelf();
-      document.querySelectorAll('article[data-testid="tweet"]').forEach(article => this.processArticle(article));
+      // 不预设 testid：任何 article / role=article 都尝试识别作者，
+      // 识别不到的容器由 processArticle 自行跳过。个人资料页不再短路清空。
+      document.querySelectorAll('article, [role="article"]').forEach(article => {
+        try { this.processArticle(article); } catch (e) {}
+      });
     },
 
     scheduleScan() {
@@ -1325,7 +1426,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.5.0');
+    console.log(PREFIX, '已启动 v1.5.1', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
   }
 
   // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
