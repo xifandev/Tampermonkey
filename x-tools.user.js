@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         X Tools 推特小工具
 // @namespace    https://github.com/xifandev/Tampermonkey
-// @version      1.6.1
+// @version      1.6.2
 // @description  推特小工具集：视频一键下载、广告屏蔽、时间线快捷关注、悬浮控制面板
 // @author       xifan
 // @license      MIT
@@ -340,7 +340,7 @@
       '</div>' +
       '<div class="xt-list"></div>' +
       '<div class="xt-foot">' +
-        '<span>v1.6.1</span>' +
+        '<span>v1.6.2</span>' +
         '<a href="https://github.com/xifandev/Tampermonkey" target="_blank" rel="noopener">仓库 ↗</a>' +
       '</div>';
     card.querySelector('.xt-close').addEventListener('click', (e) => {
@@ -526,12 +526,10 @@
         const tracks = root.querySelectorAll ?
           root.querySelectorAll('[data-testid="placementTracking"]') : [];
         for (const t of tracks) {
-          // 向上找到推文滚动单元（cellInnerDiv）或 article，整条隐藏
-          const cell = t.closest('div[data-testid="cellInnerDiv"]') ||
-                       t.closest('article[data-testid="tweet"]') ||
-                       t.closest('article');
-          if (cell && cell.style.display !== 'none') {
-            cell.style.display = 'none';
+          // 只隐藏明确的广告推文；文章页可能复用追踪标记，不能隐藏任意 article 或整片容器
+          const tweet = t.closest('article[data-testid="tweet"]');
+          if (tweet && tweet.style.display !== 'none') {
+            tweet.style.display = 'none';
             console.debug(PREFIX, '已隐藏推广推文');
           }
         }
@@ -1678,7 +1676,7 @@
     Panel.init();
     // 面板里填开关
     Panel.refresh();
-    console.log(PREFIX, '已启动 v1.6.1', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
+    console.log(PREFIX, '已启动 v1.6.2', '| 快捷关注:', Follow.enabled ? 'on' : 'off');
   }
 
   // document-start 期注册消费者并共享一次网络 Hook，DOM 操作需等 body
